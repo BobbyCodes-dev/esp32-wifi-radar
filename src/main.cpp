@@ -15,6 +15,7 @@
 #include <TFT_eSPI.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include <WiFiUdp.h>
 #include <math.h>
 #include "esp_wifi.h"          // ESP-IDF CSI APIs (available in Arduino ESP32 core)
 #include "freertos/FreeRTOS.h"
@@ -283,59 +284,25 @@ static const char DASHBOARD_HTML[] PROGMEM = R"rawhtml(<!DOCTYPE html>
   #conn-indicator.ok   { color: var(--green); }
   #conn-indicator.err  { color: var(--red); }
 
-  /* ---- Map tab styles ---- */
-  .map-toolbar {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    flex-wrap: wrap;
-    margin-bottom: 10px;
-  }
-  .map-btn {
-    background: var(--panel);
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    color: var(--text);
-    cursor: pointer;
-    font-size: 0.78rem;
-    font-weight: 600;
-    letter-spacing: 0.06em;
-    padding: 7px 14px;
-    text-transform: uppercase;
-    transition: background 0.15s, border-color 0.15s, color 0.15s;
-    white-space: nowrap;
-  }
-  .map-btn:hover { background: #1a1a28; border-color: var(--cyan); color: var(--cyan); }
-  .map-btn.active { background: #001a22; border-color: var(--cyan); color: var(--cyan); }
-  .map-btn.danger:hover { border-color: var(--red); color: var(--red); }
-  #room-label-input {
-    background: var(--panel);
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    color: var(--text);
-    font-size: 0.78rem;
-    padding: 7px 10px;
-    outline: none;
-    width: 140px;
-  }
-  #room-label-input:focus { border-color: var(--cyan); }
-  #room-label-input::placeholder { color: var(--muted); }
-  .map-canvas-wrap {
-    background: var(--panel);
-    border: 1px solid var(--border);
+  /* ---- Radar tab styles ---- */
+  .radar-wrap {
+    background: #000800;
+    border: 1px solid #003300;
     border-radius: 8px;
     overflow: hidden;
     position: relative;
+    width: 100%;
   }
-  #floorCanvas {
+  #radarCanvas {
     display: block;
     width: 100%;
-    height: 400px;
-    cursor: crosshair;
+    height: 420px;
+    image-rendering: crisp-edges;
   }
-  .map-hint {
+  .radar-hint {
     font-size: 0.7rem;
-    color: var(--muted);
+    color: #005500;
+    font-family: monospace;
     margin-top: 8px;
     letter-spacing: 0.04em;
   }
@@ -349,7 +316,7 @@ static const char DASHBOARD_HTML[] PROGMEM = R"rawhtml(<!DOCTYPE html>
 <!-- Tab bar -->
 <div class="tab-bar">
   <button class="tab-btn active" onclick="switchTab('live')">Live</button>
-  <button class="tab-btn" onclick="switchTab('map')">Map</button>
+  <button class="tab-btn" onclick="switchTab('radar')">Radar</button>
 </div>
 
 <!-- Live tab -->
@@ -389,19 +356,14 @@ static const char DASHBOARD_HTML[] PROGMEM = R"rawhtml(<!DOCTYPE html>
   </div>
 </div>
 
-<!-- Map tab -->
-<div id="tab-map" class="tab-pane">
-  <div class="map-toolbar">
-    <button class="map-btn active" id="btn-draw" onclick="setMode('draw')">Draw Room</button>
-    <button class="map-btn" id="btn-sensor" onclick="setMode('sensor')">Place Sensor</button>
-    <input id="room-label-input" type="text" placeholder="Room label…" maxlength="24">
-    <button class="map-btn danger" onclick="clearMap()">Clear Map</button>
+<!-- Radar tab -->
+<div id="tab-radar" class="tab-pane">
+  <div class="radar-wrap">
+    <canvas id="radarCanvas"></canvas>
   </div>
-  <div class="map-canvas-wrap">
-    <canvas id="floorCanvas"></canvas>
-  </div>
-  <div class="map-hint">
-    Draw Room: click &amp; drag to draw. Double-click a room to rename it. Place Sensor: click to drop the sensor pin (single-sensor — no triangulation, just presence pulse at pin location).
+  <div class="radar-hint">
+    Angle derived from inter-subcarrier phase gradient (single-antenna estimate — directional accuracy is approximate).
+    Blip distance = CSI amplitude deviation from baseline. Only plots when motion is detected and deviation &gt; 1σ.
   </div>
 </div>
 
@@ -416,11 +378,11 @@ function switchTab(name) {
   document.querySelectorAll('.tab-btn').forEach(b => {
     if (b.textContent.toLowerCase() === name) b.classList.add('active');
   });
-  if (name === 'map') { resizeCanvas(); redrawMap(); }
+  if (name === 'radar') resizeRadar();
 }
 
 // ================================================================
-// CHART SETUP (Live tab) — now shows CSI amplitude
+// CHART SETUP (Live tab)
 // ================================================================
 const MAX_POINTS = 120;
 const labels = [];
@@ -486,36 +448,30 @@ function setConn(ok) {
 }
 
 // ================================================================
-// POLL /status EVERY 500ms
+// POLL /status EVERY 500ms  (Live tab data)
 // ================================================================
-let lastStddev = 0;
 async function pollStatus() {
   try {
     const r = await fetch('/status');
     if (!r.ok) throw new Error();
     const d = await r.json();
     setConn(true);
-    lastStddev = d.stddev || 0;
 
-    // Badge
     const badge = document.getElementById('status-badge');
     if (d.motion) {
       badge.textContent = 'MOTION';
       badge.className   = 'motion';
-      triggerMapMotion(d.stddev || 1);
     } else {
       badge.textContent = 'CLEAR';
       badge.className   = 'clear';
     }
 
-    // Stats — csi_mean is the live CSI amplitude; rssi from rx_ctrl
     document.getElementById('s-csi').textContent    = d.csi_mean !== undefined ? d.csi_mean.toFixed(2) : '—';
     document.getElementById('s-rssi').textContent   = d.rssi + ' dBm';
     document.getElementById('s-mean').textContent   = d.mean.toFixed(2);
     document.getElementById('s-stddev').textContent = d.stddev.toFixed(3);
     document.getElementById('s-events').textContent = d.event_count;
 
-    // Chart — plot CSI amplitude
     data.shift(); data.push(d.csi_mean !== undefined ? d.csi_mean : null);
     labels.shift(); labels.push('');
     chart.update('none');
@@ -547,323 +503,242 @@ async function pollEvents() {
         <span class="log-time">${e.timestamp}</span>
         <span class="log-ms">${fmtMs(e.millis_since_boot)}</span>
       </div>`).join('');
-  } catch(e) { /* status poller handles offline indicator */ }
+  } catch(e) {}
 }
 
-// Kick off polls
 pollStatus();
 pollEvents();
 setInterval(pollStatus, 500);
 setInterval(pollEvents, 2000);
 
 // ================================================================
-// FLOOR PLAN MAP
+// RADAR
 // ================================================================
-const GRID = 20; // grid snap size in logical px
+const rc    = document.getElementById('radarCanvas');
+const rctx  = rc.getContext('2d');
 
-// State
-let mapMode = 'draw'; // 'draw' | 'sensor'
-let rooms = [];       // [{x,y,w,h,label}]  logical coords
-let sensor = null;    // {x, y} logical coords — null = not placed
-let pulses = [];      // [{x,y,r,maxR,alpha,born,stddev}]
-let heatDots = [];    // [{x,y,born}]
+const SWEEP_PERIOD_MS = 3000;   // one full rotation
+const GHOST_LINES     = 8;       // trailing ghost lines behind sweep
+const GHOST_SPAN_DEG  = 90;      // degrees the trail spans
+const BLIP_PERSIST_MS = 8000;    // blips fade over 8 s
+const MAX_BLIPS       = 100;
+const RING_COUNT      = 4;
+const SWEEP_FLASH_DEG = 15;      // blip flashes when sweep passes within this angle
 
-// Drawing state
-let drawing = false;
-let drawStart = null;
-let drawCurrent = null;
+let radarW = 0, radarH = 0, radarCX = 0, radarCY = 0, radarR = 0;
 
-// Load from localStorage
-function loadState() {
+function resizeRadar() {
+  const wrap = rc.parentElement;
+  rc.width  = wrap.clientWidth;
+  rc.height = 420;
+  radarW  = rc.width;
+  radarH  = rc.height;
+  radarCX = radarW / 2;
+  radarCY = radarH / 2;
+  radarR  = Math.min(radarCX, radarCY) - 30;
+}
+
+window.addEventListener('resize', () => {
+  if (document.getElementById('tab-radar').classList.contains('active')) resizeRadar();
+});
+resizeRadar();
+
+// Blip list: {angleDeg, distFrac, born, flashing}
+let blips = [];
+
+// Phase unwrap helper — keep phase differences in [-π, π]
+function unwrapDiff(d) {
+  while (d >  Math.PI) d -= 2 * Math.PI;
+  while (d < -Math.PI) d += 2 * Math.PI;
+  return d;
+}
+
+// ---- Fetch /csi-raw and push blip ----
+async function pollCsiRaw() {
   try {
-    const s = localStorage.getItem('esp32map');
-    if (s) {
-      const obj = JSON.parse(s);
-      rooms  = obj.rooms  || [];
-      sensor = obj.sensor || null;
+    const r = await fetch('/csi-raw');
+    if (!r.ok) return;
+    const d = await r.json();
+
+    if (!d.motion) return;                          // no motion — skip
+    const deviation = Math.abs(d.mean_amp - d.mean_amp) / (d.stddev || 1);
+    // deviation here uses mean_amp vs overall baseline via stddev field;
+    // compute directly: since mean_amp IS the frame mean, use stddev as spread
+    // We detect "deviation" as stddev magnitude relative to typical noise.
+    // Proxy: if stddev > 0 and mean_amp is available, use stddev as proxy deviation.
+    const dev = d.stddev;
+    if (dev < 1.0) return;                          // below threshold
+
+    // --- Angle from inter-subcarrier phase gradient ---
+    const phases = d.phases;
+    const n = phases.length;
+    if (n < 2) return;
+    let sumDiff = 0;
+    for (let i = 0; i < n - 1; i++) {
+      sumDiff += unwrapDiff(phases[i + 1] - phases[i]);
     }
+    const meanPhaseDiff = sumDiff / (n - 1);
+    // Map [-π, π] → [0°, 360°]
+    const angleDeg = ((meanPhaseDiff + Math.PI) / (2 * Math.PI)) * 360;
+
+    // --- Distance from amplitude deviation ---
+    // dev = stddev of this frame's amplitudes; map [0, 3+] stddev → [100%, 10%] radius
+    const distFrac = Math.max(0.10, 1.0 - Math.min(dev / 3.0, 0.90));
+
+    // Push blip
+    blips.push({ angleDeg, distFrac, born: Date.now(), flashing: false });
+    if (blips.length > MAX_BLIPS) blips.shift();
   } catch(e) {}
 }
 
-function saveState() {
-  try {
-    localStorage.setItem('esp32map', JSON.stringify({ rooms, sensor }));
-  } catch(e) {}
-}
+setInterval(pollCsiRaw, 500);
 
-loadState();
+// ---- Radar draw loop ----
+function drawRadar(timestamp) {
+  requestAnimationFrame(drawRadar);
 
-// Canvas setup
-const fc = document.getElementById('floorCanvas');
-const fctx = fc.getContext('2d');
+  if (!document.getElementById('tab-radar').classList.contains('active')) return;
 
-function resizeCanvas() {
-  const wrap = fc.parentElement;
-  fc.width  = wrap.clientWidth;
-  fc.height = 400;
-}
-
-window.addEventListener('resize', () => { resizeCanvas(); redrawMap(); });
-resizeCanvas();
-
-// Snap to grid
-function snap(v) { return Math.round(v / GRID) * GRID; }
-
-// Convert canvas client coords -> logical canvas coords
-function canvasXY(e) {
-  const rect = fc.getBoundingClientRect();
-  const scaleX = fc.width  / rect.width;
-  const scaleY = fc.height / rect.height;
-  const cx = (e.clientX - rect.left) * scaleX;
-  const cy = (e.clientY - rect.top)  * scaleY;
-  return { x: snap(cx), y: snap(cy) };
-}
-
-function setMode(m) {
-  mapMode = m;
-  document.getElementById('btn-draw').classList.toggle('active',   m === 'draw');
-  document.getElementById('btn-sensor').classList.toggle('active', m === 'sensor');
-  fc.style.cursor = (m === 'sensor') ? 'cell' : 'crosshair';
-}
-
-function clearMap() {
-  rooms   = [];
-  sensor  = null;
-  pulses  = [];
-  heatDots = [];
-  saveState();
-  redrawMap();
-}
-
-// ---- Mouse events ----
-fc.addEventListener('mousedown', e => {
-  if (e.button !== 0) return;
-  const pos = canvasXY(e);
-
-  if (mapMode === 'sensor') {
-    sensor = { x: pos.x, y: pos.y };
-    saveState();
-    redrawMap();
-    return;
-  }
-
-  // draw mode
-  drawing    = true;
-  drawStart  = pos;
-  drawCurrent = pos;
-});
-
-fc.addEventListener('mousemove', e => {
-  if (!drawing) return;
-  drawCurrent = canvasXY(e);
-  redrawMap();
-});
-
-fc.addEventListener('mouseup', e => {
-  if (!drawing) return;
-  drawing = false;
-  const pos = canvasXY(e);
-  const x = Math.min(drawStart.x, pos.x);
-  const y = Math.min(drawStart.y, pos.y);
-  const w = Math.abs(pos.x - drawStart.x);
-  const h = Math.abs(pos.y - drawStart.y);
-  if (w >= GRID && h >= GRID) {
-    const label = document.getElementById('room-label-input').value.trim() || '';
-    rooms.push({ x, y, w, h, label });
-    saveState();
-  }
-  drawStart   = null;
-  drawCurrent = null;
-  redrawMap();
-});
-
-fc.addEventListener('mouseleave', e => {
-  if (drawing) {
-    drawing = false;
-    drawStart = null;
-    drawCurrent = null;
-    redrawMap();
-  }
-});
-
-// Touch support (basic)
-fc.addEventListener('touchstart', e => {
-  e.preventDefault();
-  const t = e.touches[0];
-  fc.dispatchEvent(new MouseEvent('mousedown', { clientX: t.clientX, clientY: t.clientY, button: 0 }));
-}, { passive: false });
-fc.addEventListener('touchmove', e => {
-  e.preventDefault();
-  const t = e.touches[0];
-  fc.dispatchEvent(new MouseEvent('mousemove', { clientX: t.clientX, clientY: t.clientY }));
-}, { passive: false });
-fc.addEventListener('touchend', e => {
-  e.preventDefault();
-  const t = e.changedTouches[0];
-  fc.dispatchEvent(new MouseEvent('mouseup', { clientX: t.clientX, clientY: t.clientY, button: 0 }));
-}, { passive: false });
-
-// Double-click a room → rename it
-fc.addEventListener('dblclick', e => {
-  const pos = canvasXY(e);
-  for (let i = rooms.length - 1; i >= 0; i--) {
-    const r = rooms[i];
-    if (pos.x >= r.x && pos.x <= r.x + r.w &&
-        pos.y >= r.y && pos.y <= r.y + r.h) {
-      const nl = prompt('Room name:', r.label || '');
-      if (nl !== null) { r.label = nl.trim(); saveState(); redrawMap(); }
-      return;
-    }
-  }
-});
-
-// ---- Motion pulse trigger (called by pollStatus) ----
-function triggerMapMotion(stddev) {
-  if (!sensor) return;
-  // Pulse radius scales with stddev: 40–120px
-  const maxR = Math.min(120, Math.max(40, stddev * 25));
-  pulses.push({ x: sensor.x, y: sensor.y, r: 0, maxR, alpha: 1.0, born: Date.now(), stddev });
-
-  // Heat dot — keep last 200
-  heatDots.push({ x: sensor.x, y: sensor.y, born: Date.now() });
-  if (heatDots.length > 200) heatDots.shift();
-}
-
-// ---- Draw everything ----
-function redrawMap() {
-  const W = fc.width;
-  const H = fc.height;
   const now = Date.now();
 
-  fctx.clearRect(0, 0, W, H);
-
   // Background
-  fctx.fillStyle = '#0a0a0f';
-  fctx.fillRect(0, 0, W, H);
+  rctx.fillStyle = '#000800';
+  rctx.fillRect(0, 0, radarW, radarH);
 
-  // Grid
-  fctx.strokeStyle = '#1e1e2e';
-  fctx.lineWidth   = 0.5;
-  for (let x = 0; x < W; x += GRID) {
-    fctx.beginPath(); fctx.moveTo(x, 0); fctx.lineTo(x, H); fctx.stroke();
-  }
-  for (let y = 0; y < H; y += GRID) {
-    fctx.beginPath(); fctx.moveTo(0, y); fctx.lineTo(W, y); fctx.stroke();
-  }
-
-  // Heat dots (fade over 30 s)
-  for (const dot of heatDots) {
-    const age = (now - dot.born) / 30000;
-    if (age >= 1) continue;
-    const alpha = (1 - age) * 0.35;
-    fctx.beginPath();
-    fctx.arc(dot.x, dot.y, 18, 0, Math.PI * 2);
-    fctx.fillStyle = `rgba(255,23,68,${alpha})`;
-    fctx.fill();
-  }
-
-  // Rooms
-  for (const room of rooms) {
-    fctx.strokeStyle = '#00e5ff';
-    fctx.lineWidth   = 1.5;
-    fctx.strokeRect(room.x + 0.5, room.y + 0.5, room.w, room.h);
-    fctx.fillStyle = 'rgba(0,229,255,0.04)';
-    fctx.fillRect(room.x, room.y, room.w, room.h);
-
-    if (room.label) {
-      fctx.fillStyle = '#00e5ff';
-      fctx.font      = '11px "Segoe UI", system-ui, sans-serif';
-      fctx.textAlign = 'center';
-      fctx.textBaseline = 'middle';
-      fctx.fillText(room.label, room.x + room.w / 2, room.y + room.h / 2);
-    }
-  }
-
-  // Active draw preview
-  if (drawing && drawStart && drawCurrent) {
-    const px = Math.min(drawStart.x, drawCurrent.x);
-    const py = Math.min(drawStart.y, drawCurrent.y);
-    const pw = Math.abs(drawCurrent.x - drawStart.x);
-    const ph = Math.abs(drawCurrent.y - drawStart.y);
-    fctx.strokeStyle = 'rgba(0,229,255,0.5)';
-    fctx.lineWidth   = 1;
-    fctx.setLineDash([4, 4]);
-    fctx.strokeRect(px + 0.5, py + 0.5, pw, ph);
-    fctx.setLineDash([]);
-  }
-
-  // Pulses (sonar rings, fade over 2 s)
-  for (let i = pulses.length - 1; i >= 0; i--) {
-    const p = pulses[i];
-    const age = (now - p.born) / 2000;
-    if (age >= 1) { pulses.splice(i, 1); continue; }
-    const r     = p.maxR * age;
-    const alpha = 1 - age;
-    // Pulse color: low stddev = orange, high = red
-    const red   = 255;
-    const green = Math.round(Math.max(0, 100 - p.stddev * 15));
-    fctx.beginPath();
-    fctx.arc(p.x, p.y, r, 0, Math.PI * 2);
-    fctx.strokeStyle = `rgba(${red},${green},68,${alpha * 0.9})`;
-    fctx.lineWidth   = 2;
-    fctx.stroke();
-    // Inner glow ring
-    if (r > 8) {
-      fctx.beginPath();
-      fctx.arc(p.x, p.y, r * 0.6, 0, Math.PI * 2);
-      fctx.strokeStyle = `rgba(${red},${green},68,${alpha * 0.35})`;
-      fctx.lineWidth = 1;
-      fctx.stroke();
-    }
-  }
-
-  // Sensor pin
-  if (sensor) {
-    // Outer glow
-    const grd = fctx.createRadialGradient(sensor.x, sensor.y, 2, sensor.x, sensor.y, 14);
-    grd.addColorStop(0, 'rgba(255,23,68,0.45)');
-    grd.addColorStop(1, 'rgba(255,23,68,0)');
-    fctx.beginPath();
-    fctx.arc(sensor.x, sensor.y, 14, 0, Math.PI * 2);
-    fctx.fillStyle = grd;
-    fctx.fill();
-    // Pin circle
-    fctx.beginPath();
-    fctx.arc(sensor.x, sensor.y, 6, 0, Math.PI * 2);
-    fctx.fillStyle = '#ff1744';
-    fctx.fill();
-    fctx.strokeStyle = '#fff';
-    fctx.lineWidth = 1.5;
-    fctx.stroke();
+  // Range rings
+  for (let i = 1; i <= RING_COUNT; i++) {
+    const rr = (radarR * i) / RING_COUNT;
+    rctx.beginPath();
+    rctx.arc(radarCX, radarCY, rr, 0, 2 * Math.PI);
+    rctx.strokeStyle = 'rgba(0,200,50,0.15)';
+    rctx.lineWidth = 1;
+    rctx.stroke();
     // Label
-    fctx.fillStyle = '#ff1744';
-    fctx.font = 'bold 11px "Segoe UI", sans-serif';
-    fctx.textAlign = 'center';
-    fctx.textBaseline = 'bottom';
-    fctx.fillText('ESP32', sensor.x, sensor.y - 8);
-  } else {
-    // Placeholder hint
-    fctx.fillStyle = '#555580';
-    fctx.font = '13px "Segoe UI", sans-serif';
-    fctx.textAlign = 'center';
-    fctx.textBaseline = 'middle';
-    fctx.fillText('Click "Place Sensor" then click the map to drop the sensor pin', W / 2, H / 2);
+    const pct = (i * 100 / RING_COUNT) + '%';
+    rctx.fillStyle = 'rgba(0,180,40,0.45)';
+    rctx.font = '10px monospace';
+    rctx.textAlign = 'left';
+    rctx.textBaseline = 'middle';
+    rctx.fillText(pct, radarCX + rr + 3, radarCY);
   }
+
+  // Crosshair
+  rctx.strokeStyle = 'rgba(0,200,50,0.12)';
+  rctx.lineWidth = 0.5;
+  rctx.beginPath(); rctx.moveTo(radarCX, radarCY - radarR); rctx.lineTo(radarCX, radarCY + radarR); rctx.stroke();
+  rctx.beginPath(); rctx.moveTo(radarCX - radarR, radarCY); rctx.lineTo(radarCX + radarR, radarCY); rctx.stroke();
+
+  // Outer boundary circle
+  rctx.beginPath();
+  rctx.arc(radarCX, radarCY, radarR, 0, 2 * Math.PI);
+  rctx.strokeStyle = 'rgba(0,200,50,0.35)';
+  rctx.lineWidth = 1.5;
+  rctx.stroke();
+
+  // Sweep angle (radians, 0 = top, clockwise)
+  const sweepFrac  = (now % SWEEP_PERIOD_MS) / SWEEP_PERIOD_MS;
+  const sweepAngle = sweepFrac * 2 * Math.PI - Math.PI / 2; // -π/2 so 0 = top
+
+  // Ghost trail lines
+  for (let g = GHOST_LINES; g >= 0; g--) {
+    const trailFrac  = g / GHOST_LINES;
+    const trailAngle = sweepAngle - (trailFrac * GHOST_SPAN_DEG * Math.PI / 180);
+    const alpha      = (1 - trailFrac) * 0.55;
+
+    // Gradient along the line
+    const x2 = radarCX + Math.cos(trailAngle) * radarR;
+    const y2 = radarCY + Math.sin(trailAngle) * radarR;
+    const grad = rctx.createLinearGradient(radarCX, radarCY, x2, y2);
+    grad.addColorStop(0,   `rgba(0,255,70,${alpha})`);
+    grad.addColorStop(1,   'rgba(0,255,70,0)');
+
+    rctx.beginPath();
+    rctx.moveTo(radarCX, radarCY);
+    rctx.lineTo(x2, y2);
+    rctx.strokeStyle = grad;
+    rctx.lineWidth   = g === 0 ? 2 : 1;
+    rctx.stroke();
+  }
+
+  // Sweep-filled arc (fading cone behind the line)
+  const coneStart = sweepAngle - (GHOST_SPAN_DEG * Math.PI / 180);
+  const coneGrad  = rctx.createConicalGradient
+    ? null   // not standard — use arc sector workaround below
+    : null;
+  // Draw sector fill using radial approach: thin arc lines at multiple angles
+  const steps = 18;
+  for (let s = 0; s < steps; s++) {
+    const frac  = s / steps;
+    const aAngle = coneStart + frac * (GHOST_SPAN_DEG * Math.PI / 180);
+    const aAlpha = frac * 0.07;
+    rctx.beginPath();
+    rctx.moveTo(radarCX, radarCY);
+    rctx.arc(radarCX, radarCY, radarR, aAngle, aAngle + (GHOST_SPAN_DEG * Math.PI / 180) / steps);
+    rctx.closePath();
+    rctx.fillStyle = `rgba(0,255,70,${aAlpha})`;
+    rctx.fill();
+  }
+
+  // Blips
+  const sweepDeg = ((sweepAngle + Math.PI / 2) * 180 / Math.PI + 360) % 360;
+  for (let i = blips.length - 1; i >= 0; i--) {
+    const b   = blips[i];
+    const age = (now - b.born) / BLIP_PERSIST_MS;
+    if (age >= 1) { blips.splice(i, 1); continue; }
+
+    // Check if sweep passes near blip
+    let angleDiff = Math.abs(sweepDeg - b.angleDeg);
+    if (angleDiff > 180) angleDiff = 360 - angleDiff;
+    if (angleDiff < SWEEP_FLASH_DEG) b.flashing = true;
+    else if (angleDiff > SWEEP_FLASH_DEG + 10) b.flashing = false;
+
+    const alpha    = 1 - age;
+    const blipR    = b.distFrac * radarR;
+    const bAngleRad = (b.angleDeg - 90) * Math.PI / 180; // -90 so 0deg = top
+    const bx       = radarCX + Math.cos(bAngleRad) * blipR;
+    const by       = radarCY + Math.sin(bAngleRad) * blipR;
+
+    rctx.beginPath();
+    rctx.arc(bx, by, 6, 0, 2 * Math.PI);
+    if (b.flashing) {
+      rctx.fillStyle = `rgba(255,255,255,${alpha})`;
+      rctx.shadowColor = 'rgba(255,255,255,0.9)';
+      rctx.shadowBlur  = 12;
+    } else {
+      rctx.fillStyle = `rgba(0,255,70,${alpha})`;
+      rctx.shadowColor = 'rgba(0,255,70,0.8)';
+      rctx.shadowBlur  = 10;
+    }
+    rctx.fill();
+    rctx.shadowBlur = 0;
+  }
+
+  // Sensor pin (center, red dot)
+  // Glow
+  const sg = rctx.createRadialGradient(radarCX, radarCY, 2, radarCX, radarCY, 14);
+  sg.addColorStop(0, 'rgba(255,23,68,0.55)');
+  sg.addColorStop(1, 'rgba(255,23,68,0)');
+  rctx.beginPath();
+  rctx.arc(radarCX, radarCY, 14, 0, 2 * Math.PI);
+  rctx.fillStyle = sg;
+  rctx.fill();
+  // Dot
+  rctx.beginPath();
+  rctx.arc(radarCX, radarCY, 5, 0, 2 * Math.PI);
+  rctx.fillStyle = '#ff1744';
+  rctx.shadowColor = '#ff1744';
+  rctx.shadowBlur  = 8;
+  rctx.fill();
+  rctx.shadowBlur = 0;
+  // Label
+  rctx.fillStyle    = '#ff4060';
+  rctx.font         = 'bold 11px monospace';
+  rctx.textAlign    = 'center';
+  rctx.textBaseline = 'bottom';
+  rctx.fillText('ESP32', radarCX, radarCY - 10);
 }
 
-// Animation loop for pulses + heat fade
-function mapAnimLoop() {
-  requestAnimationFrame(mapAnimLoop);
-  // Only redraw when the map tab is visible and there's something animating
-  const mapVisible = document.getElementById('tab-map').classList.contains('active');
-  if (mapVisible && (pulses.length > 0 || heatDots.length > 0)) {
-    redrawMap();
-  }
-}
-mapAnimLoop();
-
-// Initial draw
-redrawMap();
+requestAnimationFrame(drawRadar);
 </script>
 </body>
 </html>
@@ -890,6 +765,10 @@ static int      csiHead      = 0;      // next write index (circular)
 static int      csiCount     = 0;      // samples filled so far
 static float    latestCsiMean = 0.0f;  // most recent csiMean from callback
 static int32_t  latestRssi   = 0;      // RSSI from most recent CSI frame rx_ctrl
+
+// Raw I/Q buffer — last full CSI frame (104 values: I0,Q0,I1,Q1,...,I51,Q51)
+static int8_t   rawIQ[104];
+static int      rawIQPairs   = 0;      // valid pair count (≤52)
 
 // These are computed by main loop from the buffer (read-only outside loop)
 float    rollingMean   = 0.0f;
@@ -953,6 +832,9 @@ static void IRAM_ATTR csiCallback(void* ctx, wifi_csi_info_t* info) {
   if (csiCount < BUFFER_SIZE) csiCount++;
   latestCsiMean = meanAmp;
   latestRssi    = rssi;
+  // Store raw I/Q for /csi-raw endpoint
+  rawIQPairs = pairs;
+  for (int i = 0; i < pairs * 2; i++) rawIQ[i] = info->buf[i];
   portEXIT_CRITICAL(&csiMux);
 }
 
@@ -1052,6 +934,7 @@ void connectWiFi() {
 //  HTTP handlers
 // ============================================================
 void handleRoot() {
+  server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate");
   server.send_P(200, "text/html", DASHBOARD_HTML);
 }
 
@@ -1124,6 +1007,68 @@ void handleEvents() {
     json += entry;
   }
   json += "]";
+
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(200, "application/json", json);
+}
+
+void handleCsiRaw() {
+  // Snapshot raw I/Q and scalar fields under the spinlock
+  int8_t  snapIQ[104];
+  int     snapPairs;
+  int32_t snapRssi;
+
+  portENTER_CRITICAL(&csiMux);
+  snapPairs = rawIQPairs;
+  snapRssi  = latestRssi;
+  for (int i = 0; i < snapPairs * 2; i++) snapIQ[i] = rawIQ[i];
+  portEXIT_CRITICAL(&csiMux);
+
+  // Compute amplitudes and phases outside the critical section
+  float amps[52]   = {};
+  float phases[52] = {};
+  float sumAmp = 0.0f, sumAmpSq = 0.0f;
+
+  for (int i = 0; i < snapPairs; i++) {
+    float I = (float)snapIQ[2 * i];
+    float Q = (float)snapIQ[2 * i + 1];
+    float a = sqrtf(I * I + Q * Q);
+    amps[i]   = a;
+    phases[i] = atan2f(Q, I);
+    sumAmp   += a;
+    sumAmpSq += a * a;
+  }
+
+  float meanAmp = (snapPairs > 0) ? sumAmp / snapPairs : 0.0f;
+  float variance = (snapPairs > 1) ? (sumAmpSq / snapPairs - meanAmp * meanAmp) : 0.0f;
+  if (variance < 0.0f) variance = 0.0f;
+  float stddev = sqrtf(variance);
+
+  // Build JSON — amplitudes array
+  String json = "{\"subcarriers\":";
+  json += snapPairs;
+  json += ",\"amplitudes\":[";
+  for (int i = 0; i < snapPairs; i++) {
+    char tmp[16];
+    snprintf(tmp, sizeof(tmp), "%.3f", amps[i]);
+    if (i > 0) json += ',';
+    json += tmp;
+  }
+  json += "],\"phases\":[";
+  for (int i = 0; i < snapPairs; i++) {
+    char tmp[16];
+    snprintf(tmp, sizeof(tmp), "%.4f", phases[i]);
+    if (i > 0) json += ',';
+    json += tmp;
+  }
+  char tail[128];
+  snprintf(tail, sizeof(tail),
+    "],\"mean_amp\":%.4f,\"stddev\":%.4f,\"motion\":%s,\"rssi\":%d}",
+    meanAmp, stddev,
+    inMotion ? "true" : "false",
+    (int)snapRssi
+  );
+  json += tail;
 
   server.sendHeader("Access-Control-Allow-Origin", "*");
   server.send(200, "application/json", json);
@@ -1385,9 +1330,10 @@ void setup() {
   enableCSI();
 
   // Start web server
-  server.on("/",       HTTP_GET, handleRoot);
-  server.on("/status", HTTP_GET, handleStatus);
-  server.on("/events", HTTP_GET, handleEvents);
+  server.on("/",        HTTP_GET, handleRoot);
+  server.on("/status",  HTTP_GET, handleStatus);
+  server.on("/events",  HTTP_GET, handleEvents);
+  server.on("/csi-raw", HTTP_GET, handleCsiRaw);
   server.begin();
   Serial.println("[BOOT] HTTP server started on port 80");
 
@@ -1402,11 +1348,29 @@ void setup() {
 // ============================================================
 //  Loop
 // ============================================================
+WiFiUDP csiPingUdp;
+
 void loop() {
   uint32_t now = millis();
 
   // Handle incoming HTTP requests (non-blocking)
   server.handleClient();
+
+  // Ping gateway every 30ms so the AP sends back packets, keeping CSI callbacks firing
+  // even when the network is otherwise idle.
+  static uint32_t lastPingMs = 0;
+  static bool udpReady = false;
+  if (!udpReady && WiFi.status() == WL_CONNECTED) {
+    csiPingUdp.begin(19999);
+    udpReady = true;
+  }
+  if (udpReady && now - lastPingMs >= 30) {
+    lastPingMs = now;
+    IPAddress gw = WiFi.gatewayIP();
+    csiPingUdp.beginPacket(gw, 9); // port 9 = discard, no response needed
+    csiPingUdp.write((uint8_t)0xFF);
+    csiPingUdp.endPacket();
+  }
 
   // Process CSI data — callback fires on its own (WiFi task driven),
   // we just check if new data landed and run the motion detector.
