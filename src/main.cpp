@@ -2,18 +2,23 @@
 // Libraries: TFT_eSPI by Bodmer, WebServer (built-in ESP32 Arduino core)
 // In TFT_eSPI/User_Setup_Select.h: uncomment Setup25_TTGO_T_Display.h
 //
-// Approach: RSSI-based motion sensing
-//   - Connects to your home WiFi router
-//   - Samples RSSI every 100ms, keeps a 50-sample rolling buffer
+// Approach: CSI (Channel State Information) motion sensing
+//   - Connects to your home WiFi router in STA mode
+//   - Registers an ESP-IDF CSI callback (called on the WiFi task)
+//   - Per callback: computes mean amplitude across 52 LLTF subcarriers (I²+Q² → sqrt)
+//   - Keeps a 50-sample rolling buffer of csiMean values
 //   - Calculates rolling mean + stddev; deviation > SENSITIVITY * stddev = motion event
-//   - Display: top = live RSSI oscilloscope waveform, bottom = motion status + stats
+//   - Display: top = live CSI amplitude oscilloscope waveform, bottom = motion status + stats
 //   - Serial: logs every motion event with millis() timestamp
-//   - Web dashboard: served at http://<device-ip>/  — live RSSI chart, event log, stats
+//   - Web dashboard: served at http://<device-ip>/ — live CSI chart, event log, stats
 
 #include <TFT_eSPI.h>
 #include <WiFi.h>
 #include <WebServer.h>
 #include <math.h>
+#include "esp_wifi.h"          // ESP-IDF CSI APIs (available in Arduino ESP32 core)
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 // ============================================================
 //  USER CONFIG — fill these in before flashing
@@ -28,7 +33,8 @@
 //   2.0 = balanced default (recommended starting point)
 //   2.5 = less sensitive (only strong disturbances)
 //   3.0 = high threshold (only dramatic movement near the router)
-#define SENSITIVITY     2.0f
+#define SENSITIVITY     2.5f
+#define CONFIRM_HITS    3       // consecutive threshold crossings required (filters fan/AC noise)
 
 // ============================================================
 //  Display / hardware
@@ -40,10 +46,9 @@
 // ============================================================
 //  Motion detection config
 // ============================================================
-#define SAMPLE_INTERVAL_MS   100    // sample RSSI every 100ms
-#define BUFFER_SIZE          50     // rolling window of samples
+#define BUFFER_SIZE          50     // rolling window of CSI mean samples
 #define MOTION_HOLD_MS       3000   // keep "MOTION" state visible for 3s after last trigger
-#define MIN_STDDEV           0.5f   // ignore micro-noise below this stddev (flat signal)
+#define MIN_STDDEV           0.3f   // ignore micro-noise below this stddev (flat/static signal)
 
 // ============================================================
 //  Event log config
@@ -64,7 +69,7 @@
 // ============================================================
 #define COL_BG          TFT_BLACK
 #define COL_GRID        0x1082    // very dark grey
-#define COL_WAVE        0x07E0    // bright green (RSSI line)
+#define COL_WAVE        0x07E0    // bright green (CSI amplitude line)
 #define COL_WAVE_OLD    0x0320    // dim green (older samples)
 #define COL_CLEAR       0x07E0    // green text for CLEAR
 #define COL_MOTION      TFT_RED
@@ -213,7 +218,8 @@ static const char DASHBOARD_HTML[] PROGMEM = R"rawhtml(<!DOCTYPE html>
     font-weight: 700;
     color: var(--text);
   }
-  .stat-value.rssi-value { color: var(--green); }
+  .stat-value.rssi-value  { color: var(--green); }
+  .stat-value.csi-value   { color: var(--cyan); }
   .stat-value.events-value { color: var(--cyan); }
 
   /* Chart */
@@ -338,7 +344,7 @@ static const char DASHBOARD_HTML[] PROGMEM = R"rawhtml(<!DOCTYPE html>
 <body>
 <div id="conn-indicator">●&nbsp;CONNECTING</div>
 
-<h1><span class="dot"></span>ESP32 WiFi Radar</h1>
+<h1><span class="dot"></span>ESP32 WiFi Radar — CSI</h1>
 
 <!-- Tab bar -->
 <div class="tab-bar">
@@ -351,6 +357,10 @@ static const char DASHBOARD_HTML[] PROGMEM = R"rawhtml(<!DOCTYPE html>
   <div id="status-badge" class="clear">CLEAR</div>
 
   <div class="stats-bar">
+    <div class="stat-card">
+      <div class="stat-label">CSI Amp</div>
+      <div class="stat-value csi-value" id="s-csi">—</div>
+    </div>
     <div class="stat-card">
       <div class="stat-label">RSSI</div>
       <div class="stat-value rssi-value" id="s-rssi">—</div>
@@ -410,7 +420,7 @@ function switchTab(name) {
 }
 
 // ================================================================
-// CHART SETUP (Live tab)
+// CHART SETUP (Live tab) — now shows CSI amplitude
 // ================================================================
 const MAX_POINTS = 120;
 const labels = [];
@@ -423,7 +433,7 @@ const chart = new Chart(ctx, {
   data: {
     labels,
     datasets: [{
-      label: 'RSSI (dBm)',
+      label: 'CSI Amplitude',
       data,
       borderColor: '#00e676',
       borderWidth: 1.5,
@@ -444,13 +454,12 @@ const chart = new Chart(ctx, {
     scales: {
       x: { display: false },
       y: {
-        min: -100,
-        max: -30,
+        min: 0,
         ticks: {
           color: '#555580',
           font: { size: 10 },
-          callback: v => v + ' dBm',
-          stepSize: 10,
+          callback: v => v.toFixed(1),
+          stepSize: 5,
         },
         grid: { color: '#1e1e2e' },
         border: { color: '#1e1e2e' },
@@ -499,14 +508,15 @@ async function pollStatus() {
       badge.className   = 'clear';
     }
 
-    // Stats
+    // Stats — csi_mean is the live CSI amplitude; rssi from rx_ctrl
+    document.getElementById('s-csi').textContent    = d.csi_mean !== undefined ? d.csi_mean.toFixed(2) : '—';
     document.getElementById('s-rssi').textContent   = d.rssi + ' dBm';
-    document.getElementById('s-mean').textContent   = d.mean.toFixed(1) + ' dBm';
-    document.getElementById('s-stddev').textContent = d.stddev.toFixed(2);
+    document.getElementById('s-mean').textContent   = d.mean.toFixed(2);
+    document.getElementById('s-stddev').textContent = d.stddev.toFixed(3);
     document.getElementById('s-events').textContent = d.event_count;
 
-    // Chart
-    data.shift(); data.push(d.rssi);
+    // Chart — plot CSI amplitude
+    data.shift(); data.push(d.csi_mean !== undefined ? d.csi_mean : null);
     labels.shift(); labels.push('');
     chart.update('none');
   } catch(e) {
@@ -868,18 +878,29 @@ TFT_eSprite statusSprite(&tft);
 
 WebServer   server(80);
 
-int32_t  rssiBuffer[BUFFER_SIZE];
-int      bufHead      = 0;       // next write index (circular)
-int      bufCount     = 0;       // samples filled so far
-float    rollingMean  = 0.0f;
+// ============================================================
+//  CSI data — shared between WiFi task (callback) and main loop
+//  Protected with a spinlock (portMUX_TYPE).
+// ============================================================
+static portMUX_TYPE csiMux = portMUX_INITIALIZER_UNLOCKED;
+
+// Rolling buffer of csiMean values (written by callback, read by main loop)
+static float    csiBuffer[BUFFER_SIZE];
+static int      csiHead      = 0;      // next write index (circular)
+static int      csiCount     = 0;      // samples filled so far
+static float    latestCsiMean = 0.0f;  // most recent csiMean from callback
+static int32_t  latestRssi   = 0;      // RSSI from most recent CSI frame rx_ctrl
+
+// These are computed by main loop from the buffer (read-only outside loop)
+float    rollingMean   = 0.0f;
 float    rollingStddev = 0.0f;
 
 uint32_t motionCount   = 0;
 uint32_t lastMotionMs  = 0;      // millis() of last detected motion event
 bool     inMotion      = false;
+int      consecutiveHits = 0;    // consecutive samples above threshold (fan filter)
 char     lastMotionStr[32] = "None";
 
-uint32_t lastSampleMs  = 0;
 uint32_t lastDrawMs    = 0;
 
 // ============================================================
@@ -903,22 +924,84 @@ void logMotionEvent(uint32_t nowMs, const char* ts, uint32_t num) {
 }
 
 // ============================================================
-//  Rolling statistics
+//  CSI callback — runs on the WiFi task (NOT the Arduino loop task)
+//  Keep it short: compute amplitude, push to buffer, set flag.
 // ============================================================
-void computeStats() {
-  if (bufCount == 0) { rollingMean = 0; rollingStddev = 0; return; }
+static void IRAM_ATTR csiCallback(void* ctx, wifi_csi_info_t* info) {
+  if (!info || !info->buf || info->len < 2) return;
+
+  // LLTF: 52 subcarriers, each I (int8) + Q (int8) = 104 values.
+  // Actual len may be 128 (LLTF) or 384 (LLTF+HT-LTF+STBC-HT-LTF).
+  // Use whichever subcarriers are available, up to 52 pairs.
+  int pairs = info->len / 2;
+  if (pairs > 52) pairs = 52;  // cap at LLTF subcarrier count
+
+  float sumAmp = 0.0f;
+  for (int i = 0; i < pairs; i++) {
+    float I = (float)info->buf[2 * i];
+    float Q = (float)info->buf[2 * i + 1];
+    sumAmp += sqrtf(I * I + Q * Q);
+  }
+  float meanAmp = (pairs > 0) ? (sumAmp / pairs) : 0.0f;
+  int32_t rssi  = (int32_t)info->rx_ctrl.rssi;
+
+  // Push into the shared rolling buffer — critical section (spinlock, not mutex,
+  // because this runs in ISR/WiFi task context where FreeRTOS mutexes are illegal)
+  portENTER_CRITICAL(&csiMux);
+  csiBuffer[csiHead] = meanAmp;
+  csiHead = (csiHead + 1) % BUFFER_SIZE;
+  if (csiCount < BUFFER_SIZE) csiCount++;
+  latestCsiMean = meanAmp;
+  latestRssi    = rssi;
+  portEXIT_CRITICAL(&csiMux);
+}
+
+// ============================================================
+//  Rolling statistics (called from main loop — reads csiBuffer)
+//  Must be called inside critical section or after copying the buffer.
+// ============================================================
+void computeStats(float* buf, int count) {
+  if (count == 0) { rollingMean = 0; rollingStddev = 0; return; }
 
   float sum = 0;
-  int   count = min(bufCount, BUFFER_SIZE);
-  for (int i = 0; i < count; i++) sum += rssiBuffer[i];
+  for (int i = 0; i < count; i++) sum += buf[i];
   rollingMean = sum / count;
 
   float varSum = 0;
   for (int i = 0; i < count; i++) {
-    float d = rssiBuffer[i] - rollingMean;
+    float d = buf[i] - rollingMean;
     varSum += d * d;
   }
   rollingStddev = sqrtf(varSum / count);
+}
+
+// ============================================================
+//  Enable CSI after WiFi connects
+// ============================================================
+void enableCSI() {
+  // Register callback first
+  esp_wifi_set_csi_rx_cb(csiCallback, NULL);
+
+  // Configure CSI — request LLTF (legacy long training field, 52 subcarriers)
+  wifi_csi_config_t cfg = {};
+  cfg.lltf_en           = true;
+  cfg.htltf_en          = false;
+  cfg.stbc_htltf2_en    = false;
+  cfg.ltf_merge_en      = true;
+  cfg.channel_filter_en = false;  // raw data, no smoothing
+  cfg.manu_scale        = false;
+  cfg.shift             = 0;
+  esp_err_t err = esp_wifi_set_csi_config(&cfg);
+  if (err != ESP_OK) {
+    Serial.printf("[CSI] Config error: %d\n", err);
+  }
+
+  err = esp_wifi_set_csi(true);
+  if (err != ESP_OK) {
+    Serial.printf("[CSI] Enable error: %d\n", err);
+  } else {
+    Serial.println("[CSI] CSI enabled — LLTF 52 subcarriers");
+  }
 }
 
 // ============================================================
@@ -973,18 +1056,45 @@ void handleRoot() {
 }
 
 void handleStatus() {
-  // Get current RSSI
-  int32_t currentRssi = 0;
-  if (bufCount > 0) {
-    currentRssi = rssiBuffer[(bufHead + BUFFER_SIZE - 1) % BUFFER_SIZE];
+  // Snapshot shared data under the spinlock
+  float    snapMean, snapStddev, snapCsiMean;
+  int32_t  snapRssi;
+  int      snapCount;
+
+  portENTER_CRITICAL(&csiMux);
+  snapCsiMean = latestCsiMean;
+  snapRssi    = latestRssi;
+  snapCount   = csiCount;
+  // Quick snapshot of buffer for stats — copy only the live count
+  float localBuf[BUFFER_SIZE];
+  int   liveCount = (snapCount < BUFFER_SIZE) ? snapCount : BUFFER_SIZE;
+  for (int i = 0; i < liveCount; i++) localBuf[i] = csiBuffer[i];
+  portEXIT_CRITICAL(&csiMux);
+
+  // Compute stats outside critical section
+  if (liveCount > 1) {
+    float sum = 0;
+    for (int i = 0; i < liveCount; i++) sum += localBuf[i];
+    snapMean = sum / liveCount;
+    float var = 0;
+    for (int i = 0; i < liveCount; i++) {
+      float d = localBuf[i] - snapMean;
+      var += d * d;
+    }
+    snapStddev = sqrtf(var / liveCount);
+  } else {
+    snapMean   = snapCsiMean;
+    snapStddev = 0.0f;
   }
 
-  char json[256];
+  char json[320];
   snprintf(json, sizeof(json),
-    "{\"rssi\":%d,\"mean\":%.2f,\"stddev\":%.2f,\"motion\":%s,\"event_count\":%lu,\"last_event_ms\":%lu}",
-    (int)currentRssi,
-    rollingMean,
-    rollingStddev,
+    "{\"csi_mean\":%.4f,\"rssi\":%d,\"mean\":%.4f,\"stddev\":%.4f,"
+    "\"motion\":%s,\"event_count\":%lu,\"last_event_ms\":%lu}",
+    snapCsiMean,
+    (int)snapRssi,
+    snapMean,
+    snapStddev,
     inMotion ? "true" : "false",
     motionCount,
     lastMotionMs
@@ -999,9 +1109,7 @@ void handleEvents() {
   String json = "[";
   bool first = true;
 
-  // Walk from newest to oldest
   for (int i = 0; i < eventLogCount; i++) {
-    // Index of i-th newest: (eventLogHead - 1 - i + EVENT_LOG_SIZE) % EVENT_LOG_SIZE
     int idx = (eventLogHead - 1 - i + EVENT_LOG_SIZE) % EVENT_LOG_SIZE;
     if (!first) json += ",";
     first = false;
@@ -1022,26 +1130,38 @@ void handleEvents() {
 }
 
 // ============================================================
-//  Sample RSSI and check for motion
+//  Process latest CSI sample and check for motion
+//  Called from main loop — reads a snapshot of the shared buffer
 // ============================================================
-void takeSample() {
-  int32_t rssi = WiFi.RSSI();
+void processCsiSample() {
+  // Copy current state out of the critical section
+  float    localBuf[BUFFER_SIZE];
+  float    currentMean;
+  int      count;
 
-  // Store in circular buffer
-  rssiBuffer[bufHead] = rssi;
-  bufHead = (bufHead + 1) % BUFFER_SIZE;
-  if (bufCount < BUFFER_SIZE) bufCount++;
+  portENTER_CRITICAL(&csiMux);
+  int snapCount = csiCount;
+  count = (snapCount < BUFFER_SIZE) ? snapCount : BUFFER_SIZE;
+  for (int i = 0; i < count; i++) localBuf[i] = csiBuffer[i];
+  currentMean = latestCsiMean;
+  portEXIT_CRITICAL(&csiMux);
 
   // Need at least 10 samples before declaring motion
-  if (bufCount < 10) return;
+  if (count < 10) return;
 
-  computeStats();
+  computeStats(localBuf, count);
 
-  // Only fire if there's meaningful variance (not a perfectly flat signal)
+  // Only fire if there's meaningful variance
   if (rollingStddev < MIN_STDDEV) return;
 
-  float deviation = fabsf((float)rssi - rollingMean);
+  float deviation = fabsf(currentMean - rollingMean);
   if (deviation > SENSITIVITY * rollingStddev) {
+    consecutiveHits++;
+  } else {
+    consecutiveHits = 0;
+  }
+
+  if (consecutiveHits >= CONFIRM_HITS) {
     uint32_t now = millis();
 
     // Debounce: don't log a new event if we just logged one < 1s ago
@@ -1049,18 +1169,23 @@ void takeSample() {
       motionCount++;
       lastMotionMs = now;
 
-      // Format timestamp as H:M:S since boot
-      uint32_t secs   = now / 1000;
-      uint32_t mins   = secs / 60;
-      uint32_t hours  = mins / 60;
+      uint32_t secs  = now / 1000;
+      uint32_t mins  = secs / 60;
+      uint32_t hours = mins / 60;
       snprintf(lastMotionStr, sizeof(lastMotionStr),
                "%02lu:%02lu:%02lu", hours, mins % 60, secs % 60);
 
       logMotionEvent(now, lastMotionStr, motionCount);
 
-      Serial.printf("[MOTION] Event #%lu at %s  RSSI=%d  mean=%.1f  stddev=%.2f  dev=%.1f\n",
-                    motionCount, lastMotionStr, rssi,
-                    rollingMean, rollingStddev, deviation);
+      // Read RSSI under lock for the log line
+      int32_t logRssi;
+      portENTER_CRITICAL(&csiMux);
+      logRssi = latestRssi;
+      portEXIT_CRITICAL(&csiMux);
+
+      Serial.printf("[MOTION] Event #%lu at %s  CSI=%.2f  mean=%.2f  stddev=%.3f  dev=%.2f  RSSI=%d\n",
+                    motionCount, lastMotionStr, currentMean,
+                    rollingMean, rollingStddev, deviation, (int)logRssi);
     }
     inMotion = true;
   }
@@ -1072,7 +1197,7 @@ void takeSample() {
 }
 
 // ============================================================
-//  Draw oscilloscope waveform (top half)
+//  Draw oscilloscope waveform (top half) — now shows CSI amplitude
 // ============================================================
 void drawGraph() {
   graphSprite.fillSprite(COL_BG);
@@ -1083,36 +1208,55 @@ void drawGraph() {
   }
   graphSprite.drawFastHLine(0, GRAPH_H - 1, GRAPH_W, COL_GRID);
 
+  // Snapshot buffer for rendering
+  float    localBuf[BUFFER_SIZE];
+  float    snapMean, snapLatest;
+  int      count;
+
+  portENTER_CRITICAL(&csiMux);
+  int snapCount = csiCount;
+  count = (snapCount < BUFFER_SIZE) ? snapCount : BUFFER_SIZE;
+  for (int i = 0; i < count; i++) localBuf[i] = csiBuffer[i];
+  snapMean   = rollingMean;      // already computed by processCsiSample
+  snapLatest = latestCsiMean;
+  portEXIT_CRITICAL(&csiMux);
+
+  if (count < 2) { graphSprite.pushSprite(0, GRAPH_Y); return; }
+
+  // Auto-scale: find min/max of buffer for Y mapping
+  float minAmp = localBuf[0], maxAmp = localBuf[0];
+  for (int i = 1; i < count; i++) {
+    if (localBuf[i] < minAmp) minAmp = localBuf[i];
+    if (localBuf[i] > maxAmp) maxAmp = localBuf[i];
+  }
+  float range = maxAmp - minAmp;
+  if (range < 2.0f) {
+    // Pad the range so a flat signal still draws in the middle
+    float center = (maxAmp + minAmp) / 2.0f;
+    minAmp = center - 1.0f;
+    maxAmp = center + 1.0f;
+    range  = 2.0f;
+  }
+
   // Draw the mean line
-  if (bufCount >= 10) {
-    // Map mean RSSI to Y pixel
-    int meanY = map((int)rollingMean, -100, -30, GRAPH_H - 2, 2);
+  if (count >= 10) {
+    int meanY = map((int)(snapMean * 100), (int)(minAmp * 100), (int)(maxAmp * 100), GRAPH_H - 2, 2);
     meanY = constrain(meanY, 2, GRAPH_H - 2);
     graphSprite.drawFastHLine(0, meanY, GRAPH_W, COL_MEAN);
   }
 
-  // Draw RSSI samples as a waveform — oldest on left, newest on right
-  // We have up to BUFFER_SIZE samples. Map them across GRAPH_W pixels.
-  int count = min(bufCount, BUFFER_SIZE);
-  if (count < 2) { graphSprite.pushSprite(0, GRAPH_Y); return; }
-
-  // Walk from oldest to newest
-  // oldest sample index: if buffer is full, it's bufHead (next write = oldest)
-  //                      if not full, it's 0
-  int startIdx = (bufCount >= BUFFER_SIZE) ? bufHead : 0;
-
+  // Walk oldest → newest
+  int startIdx = (snapCount >= BUFFER_SIZE) ? csiHead : 0;
   int prevX = -1, prevY = -1;
   for (int i = 0; i < count; i++) {
-    int idx  = (startIdx + i) % BUFFER_SIZE;
-    int32_t rssi = rssiBuffer[idx];
-
-    int px = map(i, 0, count - 1, 0, GRAPH_W - 1);
-    int py = map((int)rssi, -100, -30, GRAPH_H - 2, 2);
+    int idx = (startIdx + i) % BUFFER_SIZE;
+    int px  = map(i, 0, count - 1, 0, GRAPH_W - 1);
+    int py  = map((int)(localBuf[idx] * 100),
+                  (int)(minAmp * 100), (int)(maxAmp * 100),
+                  GRAPH_H - 2, 2);
     py = constrain(py, 2, GRAPH_H - 2);
 
-    // Older samples dimmer, newer brighter
     uint16_t col = (i > count - 10) ? COL_WAVE : COL_WAVE_OLD;
-
     if (prevX >= 0) {
       graphSprite.drawLine(prevX, prevY, px, py, col);
     }
@@ -1120,19 +1264,16 @@ void drawGraph() {
     prevY = py;
   }
 
-  // Label: current RSSI in top-left
+  // Label: current CSI amplitude in top-left
   graphSprite.setTextFont(1);
   graphSprite.setTextColor(COL_TEXT, COL_BG);
   graphSprite.setCursor(2, 2);
-  if (bufCount > 0) {
-    int32_t latest = rssiBuffer[(bufHead + BUFFER_SIZE - 1) % BUFFER_SIZE];
-    graphSprite.printf("%d dBm", latest);
-  }
+  graphSprite.printf("%.1f", snapLatest);
 
-  // Label: "RSSI" header on right
+  // Label: "CSI" header on right
   graphSprite.setTextColor(COL_LABEL, COL_BG);
-  graphSprite.setCursor(GRAPH_W - 36, 2);
-  graphSprite.print("RSSI");
+  graphSprite.setCursor(GRAPH_W - 24, 2);
+  graphSprite.print("CSI");
 
   graphSprite.pushSprite(0, GRAPH_Y);
 }
@@ -1161,12 +1302,14 @@ void drawStatus() {
   }
 
   // --- Motion confidence bar (right of badge) ---
-  // Shows how close current RSSI is to triggering threshold
   float confidence = 0;
-  if (bufCount >= 10 && rollingStddev >= MIN_STDDEV) {
-    int32_t latest = rssiBuffer[(bufHead + BUFFER_SIZE - 1) % BUFFER_SIZE];
-    float dev = fabsf((float)latest - rollingMean);
-    confidence = dev / (SENSITIVITY * rollingStddev);  // 1.0 = at threshold
+  if (rollingStddev >= MIN_STDDEV) {
+    float snapLatest;
+    portENTER_CRITICAL(&csiMux);
+    snapLatest = latestCsiMean;
+    portEXIT_CRITICAL(&csiMux);
+    float dev = fabsf(snapLatest - rollingMean);
+    confidence = dev / (SENSITIVITY * rollingStddev);
     confidence = constrain(confidence, 0.0f, 1.0f);
   }
   int barX   = 96;
@@ -1200,9 +1343,13 @@ void drawStatus() {
   // Mean / stddev
   statusSprite.setTextColor(COL_LABEL, COL_BG);
   statusSprite.setCursor(0, 52);
-  if (bufCount >= 2) {
-    statusSprite.setTextColor(COL_LABEL, COL_BG);
-    statusSprite.printf("mean %.1f  sd %.2f", rollingMean, rollingStddev);
+
+  portENTER_CRITICAL(&csiMux);
+  int snapCount = csiCount;
+  portEXIT_CRITICAL(&csiMux);
+
+  if (snapCount >= 2) {
+    statusSprite.printf("mean %.2f  sd %.3f", rollingMean, rollingStddev);
   } else {
     statusSprite.setTextColor(COL_LABEL, COL_BG);
     statusSprite.print("Warming up...");
@@ -1234,6 +1381,9 @@ void setup() {
 
   connectWiFi();
 
+  // Enable CSI (must be done after WiFi connects in STA mode)
+  enableCSI();
+
   // Start web server
   server.on("/",       HTTP_GET, handleRoot);
   server.on("/status", HTTP_GET, handleStatus);
@@ -1244,9 +1394,9 @@ void setup() {
   tft.fillScreen(COL_BG);
   tft.drawFastHLine(0, DIVIDER_Y, W, COL_DIVIDER);
 
-  Serial.printf("[BOOT] WiFi Motion Radar running. SSID=%s  Sensitivity=%.1f\n",
+  Serial.printf("[BOOT] WiFi CSI Radar running. SSID=%s  Sensitivity=%.1f\n",
                 WIFI_SSID, SENSITIVITY);
-  Serial.println("[BOOT] Serial format: [MOTION] Event #N at HH:MM:SS  RSSI=X  mean=M  stddev=S  dev=D");
+  Serial.println("[BOOT] Serial format: [MOTION] Event #N at HH:MM:SS  CSI=X  mean=M  stddev=S  dev=D  RSSI=R");
 }
 
 // ============================================================
@@ -1258,19 +1408,26 @@ void loop() {
   // Handle incoming HTTP requests (non-blocking)
   server.handleClient();
 
-  // Sample RSSI on interval
-  if (now - lastSampleMs >= SAMPLE_INTERVAL_MS) {
-    lastSampleMs = now;
-    if (WiFi.status() == WL_CONNECTED) {
-      takeSample();
-    } else {
-      // Reconnect if dropped
+  // Process CSI data — callback fires on its own (WiFi task driven),
+  // we just check if new data landed and run the motion detector.
+  // Rate-limit to ~every 100ms to keep parity with old RSSI sample rate.
+  static uint32_t lastProcessMs = 0;
+  if (now - lastProcessMs >= 100) {
+    lastProcessMs = now;
+
+    portENTER_CRITICAL(&csiMux);
+    int snapCount = csiCount;
+    portEXIT_CRITICAL(&csiMux);
+
+    if (snapCount > 0 && WiFi.status() == WL_CONNECTED) {
+      processCsiSample();
+    } else if (WiFi.status() != WL_CONNECTED) {
       Serial.println("[WARN] WiFi disconnected, reconnecting...");
       WiFi.reconnect();
     }
   }
 
-  // Redraw display every ~100ms (synced to sample rate)
+  // Redraw display every ~100ms
   if (now - lastDrawMs >= 100) {
     lastDrawMs = now;
     tft.drawFastHLine(0, DIVIDER_Y, W, COL_DIVIDER);
