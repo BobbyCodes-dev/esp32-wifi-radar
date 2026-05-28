@@ -16,8 +16,8 @@
 // ============================================================
 //  USER CONFIG — fill these in before flashing
 // ============================================================
-#define WIFI_SSID       "YOUR_SSID_HERE"
-#define WIFI_PASSWORD   "YOUR_PASSWORD_HERE"
+#define WIFI_SSID       "wifi gov secrets"
+#define WIFI_PASSWORD   "Corona33!"
 
 // Sensitivity: how many standard deviations from the rolling mean
 // triggers a motion event. Lower = more sensitive (more false positives).
