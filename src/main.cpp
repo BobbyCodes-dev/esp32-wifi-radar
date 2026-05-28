@@ -18,7 +18,7 @@
 // ============================================================
 //  USER CONFIG — fill these in before flashing
 // ============================================================
-#define WIFI_SSID       "Gov. Secrets"
+#define WIFI_SSID       "swyft 2.4"
 #define WIFI_PASSWORD   "Corona33!"
 
 // Sensitivity: how many standard deviations from the rolling mean
@@ -123,12 +123,40 @@ static const char DASHBOARD_HTML[] PROGMEM = R"rawhtml(<!DOCTYPE html>
     background: var(--green);
     display: inline-block;
     box-shadow: 0 0 8px var(--green);
-    animation: pulse 1.4s ease-in-out infinite;
+    animation: blink 1.4s ease-in-out infinite;
   }
-  @keyframes pulse {
+  @keyframes blink {
     0%, 100% { opacity: 1; }
     50%       { opacity: 0.3; }
   }
+
+  /* Tab bar */
+  .tab-bar {
+    display: flex;
+    gap: 4px;
+    margin-bottom: 16px;
+    border-bottom: 1px solid var(--border);
+  }
+  .tab-btn {
+    background: none;
+    border: none;
+    border-bottom: 2px solid transparent;
+    color: var(--muted);
+    cursor: pointer;
+    font-size: 0.82rem;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    padding: 8px 18px;
+    text-transform: uppercase;
+    transition: color 0.15s, border-color 0.15s;
+    margin-bottom: -1px;
+  }
+  .tab-btn.active {
+    color: var(--cyan);
+    border-bottom-color: var(--cyan);
+  }
+  .tab-pane { display: none; }
+  .tab-pane.active { display: block; }
 
   /* Status badge */
   #status-badge {
@@ -248,6 +276,63 @@ static const char DASHBOARD_HTML[] PROGMEM = R"rawhtml(<!DOCTYPE html>
   }
   #conn-indicator.ok   { color: var(--green); }
   #conn-indicator.err  { color: var(--red); }
+
+  /* ---- Map tab styles ---- */
+  .map-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin-bottom: 10px;
+  }
+  .map-btn {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    cursor: pointer;
+    font-size: 0.78rem;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    padding: 7px 14px;
+    text-transform: uppercase;
+    transition: background 0.15s, border-color 0.15s, color 0.15s;
+    white-space: nowrap;
+  }
+  .map-btn:hover { background: #1a1a28; border-color: var(--cyan); color: var(--cyan); }
+  .map-btn.active { background: #001a22; border-color: var(--cyan); color: var(--cyan); }
+  .map-btn.danger:hover { border-color: var(--red); color: var(--red); }
+  #room-label-input {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    font-size: 0.78rem;
+    padding: 7px 10px;
+    outline: none;
+    width: 140px;
+  }
+  #room-label-input:focus { border-color: var(--cyan); }
+  #room-label-input::placeholder { color: var(--muted); }
+  .map-canvas-wrap {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+    position: relative;
+  }
+  #floorCanvas {
+    display: block;
+    width: 100%;
+    height: 400px;
+    cursor: crosshair;
+  }
+  .map-hint {
+    font-size: 0.7rem;
+    color: var(--muted);
+    margin-top: 8px;
+    letter-spacing: 0.04em;
+  }
 </style>
 </head>
 <body>
@@ -255,38 +340,78 @@ static const char DASHBOARD_HTML[] PROGMEM = R"rawhtml(<!DOCTYPE html>
 
 <h1><span class="dot"></span>ESP32 WiFi Radar</h1>
 
-<div id="status-badge" class="clear">CLEAR</div>
+<!-- Tab bar -->
+<div class="tab-bar">
+  <button class="tab-btn active" onclick="switchTab('live')">Live</button>
+  <button class="tab-btn" onclick="switchTab('map')">Map</button>
+</div>
 
-<div class="stats-bar">
-  <div class="stat-card">
-    <div class="stat-label">RSSI</div>
-    <div class="stat-value rssi-value" id="s-rssi">—</div>
+<!-- Live tab -->
+<div id="tab-live" class="tab-pane active">
+  <div id="status-badge" class="clear">CLEAR</div>
+
+  <div class="stats-bar">
+    <div class="stat-card">
+      <div class="stat-label">RSSI</div>
+      <div class="stat-value rssi-value" id="s-rssi">—</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Mean</div>
+      <div class="stat-value" id="s-mean">—</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Std Dev</div>
+      <div class="stat-value" id="s-stddev">—</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Events</div>
+      <div class="stat-value events-value" id="s-events">—</div>
+    </div>
   </div>
-  <div class="stat-card">
-    <div class="stat-label">Mean</div>
-    <div class="stat-value" id="s-mean">—</div>
+
+  <div class="chart-panel">
+    <canvas id="rssiChart"></canvas>
   </div>
-  <div class="stat-card">
-    <div class="stat-label">Std Dev</div>
-    <div class="stat-value" id="s-stddev">—</div>
-  </div>
-  <div class="stat-card">
-    <div class="stat-label">Events</div>
-    <div class="stat-value events-value" id="s-events">—</div>
+
+  <div class="log-panel">
+    <div class="log-title">Motion Event Log (newest first)</div>
+    <div id="event-log"><div class="no-events">No events yet</div></div>
   </div>
 </div>
 
-<div class="chart-panel">
-  <canvas id="rssiChart"></canvas>
-</div>
-
-<div class="log-panel">
-  <div class="log-title">Motion Event Log (newest first)</div>
-  <div id="event-log"><div class="no-events">No events yet</div></div>
+<!-- Map tab -->
+<div id="tab-map" class="tab-pane">
+  <div class="map-toolbar">
+    <button class="map-btn active" id="btn-draw" onclick="setMode('draw')">Draw Room</button>
+    <button class="map-btn" id="btn-sensor" onclick="setMode('sensor')">Place Sensor</button>
+    <input id="room-label-input" type="text" placeholder="Room label…" maxlength="24">
+    <button class="map-btn danger" onclick="clearMap()">Clear Map</button>
+  </div>
+  <div class="map-canvas-wrap">
+    <canvas id="floorCanvas"></canvas>
+  </div>
+  <div class="map-hint">
+    Draw Room: click &amp; drag to draw. Double-click a room to rename it. Place Sensor: click to drop the sensor pin (single-sensor — no triangulation, just presence pulse at pin location).
+  </div>
 </div>
 
 <script>
-// ---- Chart setup ----
+// ================================================================
+// TAB SWITCHING
+// ================================================================
+function switchTab(name) {
+  document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  document.getElementById('tab-' + name).classList.add('active');
+  document.querySelectorAll('.tab-btn').forEach(b => {
+    if (b.textContent.toLowerCase() === name) b.classList.add('active');
+  });
+  if (name === 'map') { resizeCanvas(); redrawMap(); }
+}
+
+// ================================================================
+// CHART SETUP (Live tab)
+// ================================================================
 const MAX_POINTS = 120;
 const labels = [];
 const data = [];
@@ -334,7 +459,9 @@ const chart = new Chart(ctx, {
   }
 });
 
-// ---- Helpers ----
+// ================================================================
+// HELPERS
+// ================================================================
 function fmtMs(ms) {
   const s  = Math.floor(ms / 1000);
   const h  = Math.floor(s / 3600);
@@ -349,19 +476,24 @@ function setConn(ok) {
   connEl.className   = ok ? 'ok' : 'err';
 }
 
-// ---- Poll /status every 500ms ----
+// ================================================================
+// POLL /status EVERY 500ms
+// ================================================================
+let lastStddev = 0;
 async function pollStatus() {
   try {
     const r = await fetch('/status');
     if (!r.ok) throw new Error();
     const d = await r.json();
     setConn(true);
+    lastStddev = d.stddev || 0;
 
     // Badge
     const badge = document.getElementById('status-badge');
     if (d.motion) {
       badge.textContent = 'MOTION';
       badge.className   = 'motion';
+      triggerMapMotion(d.stddev || 1);
     } else {
       badge.textContent = 'CLEAR';
       badge.className   = 'clear';
@@ -382,7 +514,9 @@ async function pollStatus() {
   }
 }
 
-// ---- Poll /events every 2s ----
+// ================================================================
+// POLL /events EVERY 2s
+// ================================================================
 let lastEventCount = -1;
 async function pollEvents() {
   try {
@@ -403,7 +537,7 @@ async function pollEvents() {
         <span class="log-time">${e.timestamp}</span>
         <span class="log-ms">${fmtMs(e.millis_since_boot)}</span>
       </div>`).join('');
-  } catch(e) { /* ignore — status poller handles offline indicator */ }
+  } catch(e) { /* status poller handles offline indicator */ }
 }
 
 // Kick off polls
@@ -411,6 +545,315 @@ pollStatus();
 pollEvents();
 setInterval(pollStatus, 500);
 setInterval(pollEvents, 2000);
+
+// ================================================================
+// FLOOR PLAN MAP
+// ================================================================
+const GRID = 20; // grid snap size in logical px
+
+// State
+let mapMode = 'draw'; // 'draw' | 'sensor'
+let rooms = [];       // [{x,y,w,h,label}]  logical coords
+let sensor = null;    // {x, y} logical coords — null = not placed
+let pulses = [];      // [{x,y,r,maxR,alpha,born,stddev}]
+let heatDots = [];    // [{x,y,born}]
+
+// Drawing state
+let drawing = false;
+let drawStart = null;
+let drawCurrent = null;
+
+// Load from localStorage
+function loadState() {
+  try {
+    const s = localStorage.getItem('esp32map');
+    if (s) {
+      const obj = JSON.parse(s);
+      rooms  = obj.rooms  || [];
+      sensor = obj.sensor || null;
+    }
+  } catch(e) {}
+}
+
+function saveState() {
+  try {
+    localStorage.setItem('esp32map', JSON.stringify({ rooms, sensor }));
+  } catch(e) {}
+}
+
+loadState();
+
+// Canvas setup
+const fc = document.getElementById('floorCanvas');
+const fctx = fc.getContext('2d');
+
+function resizeCanvas() {
+  const wrap = fc.parentElement;
+  fc.width  = wrap.clientWidth;
+  fc.height = 400;
+}
+
+window.addEventListener('resize', () => { resizeCanvas(); redrawMap(); });
+resizeCanvas();
+
+// Snap to grid
+function snap(v) { return Math.round(v / GRID) * GRID; }
+
+// Convert canvas client coords -> logical canvas coords
+function canvasXY(e) {
+  const rect = fc.getBoundingClientRect();
+  const scaleX = fc.width  / rect.width;
+  const scaleY = fc.height / rect.height;
+  const cx = (e.clientX - rect.left) * scaleX;
+  const cy = (e.clientY - rect.top)  * scaleY;
+  return { x: snap(cx), y: snap(cy) };
+}
+
+function setMode(m) {
+  mapMode = m;
+  document.getElementById('btn-draw').classList.toggle('active',   m === 'draw');
+  document.getElementById('btn-sensor').classList.toggle('active', m === 'sensor');
+  fc.style.cursor = (m === 'sensor') ? 'cell' : 'crosshair';
+}
+
+function clearMap() {
+  rooms   = [];
+  sensor  = null;
+  pulses  = [];
+  heatDots = [];
+  saveState();
+  redrawMap();
+}
+
+// ---- Mouse events ----
+fc.addEventListener('mousedown', e => {
+  if (e.button !== 0) return;
+  const pos = canvasXY(e);
+
+  if (mapMode === 'sensor') {
+    sensor = { x: pos.x, y: pos.y };
+    saveState();
+    redrawMap();
+    return;
+  }
+
+  // draw mode
+  drawing    = true;
+  drawStart  = pos;
+  drawCurrent = pos;
+});
+
+fc.addEventListener('mousemove', e => {
+  if (!drawing) return;
+  drawCurrent = canvasXY(e);
+  redrawMap();
+});
+
+fc.addEventListener('mouseup', e => {
+  if (!drawing) return;
+  drawing = false;
+  const pos = canvasXY(e);
+  const x = Math.min(drawStart.x, pos.x);
+  const y = Math.min(drawStart.y, pos.y);
+  const w = Math.abs(pos.x - drawStart.x);
+  const h = Math.abs(pos.y - drawStart.y);
+  if (w >= GRID && h >= GRID) {
+    const label = document.getElementById('room-label-input').value.trim() || '';
+    rooms.push({ x, y, w, h, label });
+    saveState();
+  }
+  drawStart   = null;
+  drawCurrent = null;
+  redrawMap();
+});
+
+fc.addEventListener('mouseleave', e => {
+  if (drawing) {
+    drawing = false;
+    drawStart = null;
+    drawCurrent = null;
+    redrawMap();
+  }
+});
+
+// Touch support (basic)
+fc.addEventListener('touchstart', e => {
+  e.preventDefault();
+  const t = e.touches[0];
+  fc.dispatchEvent(new MouseEvent('mousedown', { clientX: t.clientX, clientY: t.clientY, button: 0 }));
+}, { passive: false });
+fc.addEventListener('touchmove', e => {
+  e.preventDefault();
+  const t = e.touches[0];
+  fc.dispatchEvent(new MouseEvent('mousemove', { clientX: t.clientX, clientY: t.clientY }));
+}, { passive: false });
+fc.addEventListener('touchend', e => {
+  e.preventDefault();
+  const t = e.changedTouches[0];
+  fc.dispatchEvent(new MouseEvent('mouseup', { clientX: t.clientX, clientY: t.clientY, button: 0 }));
+}, { passive: false });
+
+// Double-click a room → rename it
+fc.addEventListener('dblclick', e => {
+  const pos = canvasXY(e);
+  for (let i = rooms.length - 1; i >= 0; i--) {
+    const r = rooms[i];
+    if (pos.x >= r.x && pos.x <= r.x + r.w &&
+        pos.y >= r.y && pos.y <= r.y + r.h) {
+      const nl = prompt('Room name:', r.label || '');
+      if (nl !== null) { r.label = nl.trim(); saveState(); redrawMap(); }
+      return;
+    }
+  }
+});
+
+// ---- Motion pulse trigger (called by pollStatus) ----
+function triggerMapMotion(stddev) {
+  if (!sensor) return;
+  // Pulse radius scales with stddev: 40–120px
+  const maxR = Math.min(120, Math.max(40, stddev * 25));
+  pulses.push({ x: sensor.x, y: sensor.y, r: 0, maxR, alpha: 1.0, born: Date.now(), stddev });
+
+  // Heat dot — keep last 200
+  heatDots.push({ x: sensor.x, y: sensor.y, born: Date.now() });
+  if (heatDots.length > 200) heatDots.shift();
+}
+
+// ---- Draw everything ----
+function redrawMap() {
+  const W = fc.width;
+  const H = fc.height;
+  const now = Date.now();
+
+  fctx.clearRect(0, 0, W, H);
+
+  // Background
+  fctx.fillStyle = '#0a0a0f';
+  fctx.fillRect(0, 0, W, H);
+
+  // Grid
+  fctx.strokeStyle = '#1e1e2e';
+  fctx.lineWidth   = 0.5;
+  for (let x = 0; x < W; x += GRID) {
+    fctx.beginPath(); fctx.moveTo(x, 0); fctx.lineTo(x, H); fctx.stroke();
+  }
+  for (let y = 0; y < H; y += GRID) {
+    fctx.beginPath(); fctx.moveTo(0, y); fctx.lineTo(W, y); fctx.stroke();
+  }
+
+  // Heat dots (fade over 30 s)
+  for (const dot of heatDots) {
+    const age = (now - dot.born) / 30000;
+    if (age >= 1) continue;
+    const alpha = (1 - age) * 0.35;
+    fctx.beginPath();
+    fctx.arc(dot.x, dot.y, 18, 0, Math.PI * 2);
+    fctx.fillStyle = `rgba(255,23,68,${alpha})`;
+    fctx.fill();
+  }
+
+  // Rooms
+  for (const room of rooms) {
+    fctx.strokeStyle = '#00e5ff';
+    fctx.lineWidth   = 1.5;
+    fctx.strokeRect(room.x + 0.5, room.y + 0.5, room.w, room.h);
+    fctx.fillStyle = 'rgba(0,229,255,0.04)';
+    fctx.fillRect(room.x, room.y, room.w, room.h);
+
+    if (room.label) {
+      fctx.fillStyle = '#00e5ff';
+      fctx.font      = '11px "Segoe UI", system-ui, sans-serif';
+      fctx.textAlign = 'center';
+      fctx.textBaseline = 'middle';
+      fctx.fillText(room.label, room.x + room.w / 2, room.y + room.h / 2);
+    }
+  }
+
+  // Active draw preview
+  if (drawing && drawStart && drawCurrent) {
+    const px = Math.min(drawStart.x, drawCurrent.x);
+    const py = Math.min(drawStart.y, drawCurrent.y);
+    const pw = Math.abs(drawCurrent.x - drawStart.x);
+    const ph = Math.abs(drawCurrent.y - drawStart.y);
+    fctx.strokeStyle = 'rgba(0,229,255,0.5)';
+    fctx.lineWidth   = 1;
+    fctx.setLineDash([4, 4]);
+    fctx.strokeRect(px + 0.5, py + 0.5, pw, ph);
+    fctx.setLineDash([]);
+  }
+
+  // Pulses (sonar rings, fade over 2 s)
+  for (let i = pulses.length - 1; i >= 0; i--) {
+    const p = pulses[i];
+    const age = (now - p.born) / 2000;
+    if (age >= 1) { pulses.splice(i, 1); continue; }
+    const r     = p.maxR * age;
+    const alpha = 1 - age;
+    // Pulse color: low stddev = orange, high = red
+    const red   = 255;
+    const green = Math.round(Math.max(0, 100 - p.stddev * 15));
+    fctx.beginPath();
+    fctx.arc(p.x, p.y, r, 0, Math.PI * 2);
+    fctx.strokeStyle = `rgba(${red},${green},68,${alpha * 0.9})`;
+    fctx.lineWidth   = 2;
+    fctx.stroke();
+    // Inner glow ring
+    if (r > 8) {
+      fctx.beginPath();
+      fctx.arc(p.x, p.y, r * 0.6, 0, Math.PI * 2);
+      fctx.strokeStyle = `rgba(${red},${green},68,${alpha * 0.35})`;
+      fctx.lineWidth = 1;
+      fctx.stroke();
+    }
+  }
+
+  // Sensor pin
+  if (sensor) {
+    // Outer glow
+    const grd = fctx.createRadialGradient(sensor.x, sensor.y, 2, sensor.x, sensor.y, 14);
+    grd.addColorStop(0, 'rgba(255,23,68,0.45)');
+    grd.addColorStop(1, 'rgba(255,23,68,0)');
+    fctx.beginPath();
+    fctx.arc(sensor.x, sensor.y, 14, 0, Math.PI * 2);
+    fctx.fillStyle = grd;
+    fctx.fill();
+    // Pin circle
+    fctx.beginPath();
+    fctx.arc(sensor.x, sensor.y, 6, 0, Math.PI * 2);
+    fctx.fillStyle = '#ff1744';
+    fctx.fill();
+    fctx.strokeStyle = '#fff';
+    fctx.lineWidth = 1.5;
+    fctx.stroke();
+    // Label
+    fctx.fillStyle = '#ff1744';
+    fctx.font = 'bold 11px "Segoe UI", sans-serif';
+    fctx.textAlign = 'center';
+    fctx.textBaseline = 'bottom';
+    fctx.fillText('ESP32', sensor.x, sensor.y - 8);
+  } else {
+    // Placeholder hint
+    fctx.fillStyle = '#555580';
+    fctx.font = '13px "Segoe UI", sans-serif';
+    fctx.textAlign = 'center';
+    fctx.textBaseline = 'middle';
+    fctx.fillText('Click "Place Sensor" then click the map to drop the sensor pin', W / 2, H / 2);
+  }
+}
+
+// Animation loop for pulses + heat fade
+function mapAnimLoop() {
+  requestAnimationFrame(mapAnimLoop);
+  // Only redraw when the map tab is visible and there's something animating
+  const mapVisible = document.getElementById('tab-map').classList.contains('active');
+  if (mapVisible && (pulses.length > 0 || heatDots.length > 0)) {
+    redrawMap();
+  }
+}
+mapAnimLoop();
+
+// Initial draw
+redrawMap();
 </script>
 </body>
 </html>
