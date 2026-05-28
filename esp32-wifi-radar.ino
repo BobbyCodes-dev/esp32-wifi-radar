@@ -1,273 +1,334 @@
-// esp32-wifi-radar — WiFi Radar for LilyGo T-Display (ESP32, 135x240)
+// esp32-wifi-radar — WiFi Motion/Presence Detector for LilyGo T-Display (ESP32, 135x240)
 // Libraries: TFT_eSPI by Bodmer
 // In TFT_eSPI/User_Setup_Select.h: uncomment Setup25_TTGO_T_Display.h
 //
-// Features:
-//   - Scans nearby WiFi (SSID, RSSI, channel, encryption)
-//   - Radar sweep animation with blips plotted by signal strength
-//   - Color-coded blips: green=strong, yellow=medium, red=weak
-//   - Sidebar cycles through detected networks with SSID + RSSI
-//   - Scan refreshes every 5 seconds
+// Approach: RSSI-based motion sensing
+//   - Connects to your home WiFi router
+//   - Samples RSSI every 100ms, keeps a 50-sample rolling buffer
+//   - Calculates rolling mean + stddev; deviation > SENSITIVITY * stddev = motion event
+//   - Display: top = live RSSI oscilloscope waveform, bottom = motion status + stats
+//   - Serial: logs every motion event with millis() timestamp
 
 #include <TFT_eSPI.h>
 #include <WiFi.h>
 #include <math.h>
 
-// --- Display dimensions (T-Display landscape) ---
+// ============================================================
+//  USER CONFIG — fill these in before flashing
+// ============================================================
+#define WIFI_SSID       "YOUR_SSID_HERE"
+#define WIFI_PASSWORD   "YOUR_PASSWORD_HERE"
+
+// Sensitivity: how many standard deviations from the rolling mean
+// triggers a motion event. Lower = more sensitive (more false positives).
+// Higher = less sensitive (may miss subtle movement).
+//   1.5 = very sensitive (twitchy, good for detecting distant/subtle motion)
+//   2.0 = balanced default (recommended starting point)
+//   2.5 = less sensitive (only strong disturbances)
+//   3.0 = high threshold (only dramatic movement near the router)
+#define SENSITIVITY     2.0f
+
+// ============================================================
+//  Display / hardware
+// ============================================================
 #define W   240
 #define H   135
-
-// --- Radar area (left square region) ---
-#define RADAR_CX   67          // center x of radar circle
-#define RADAR_CY   67          // center y of radar circle
-#define RADAR_R    62          // radar radius
-
-// --- Sidebar ---
-#define SIDEBAR_X  137         // sidebar starts here
-#define SIDEBAR_W  (W - SIDEBAR_X - 2)
-
-// --- Colors ---
-#define COL_BG        TFT_BLACK
-#define COL_GRID      0x0841   // very dark green
-#define COL_SWEEP     0x07E0   // bright green
-#define COL_SWEEP_DIM 0x0320   // dim trailing green
-#define COL_STRONG    TFT_GREEN
-#define COL_MED       TFT_YELLOW
-#define COL_WEAK      TFT_RED
-#define COL_TEXT      TFT_WHITE
-#define COL_TITLE     0x07E0
-#define COL_DIVIDER   0x2945
-
-// --- Sweep config ---
-#define SWEEP_STEP_DEG   3      // degrees per frame
-#define SCAN_INTERVAL_MS 5000   // rescan every 5s
-#define MAX_NETWORKS     20
-#define TRAIL_STEPS      8      // number of trailing sweep lines
-
-// --- Blip fade config ---
-#define BLIP_TTL_TICKS   120   // how long a blip stays bright after being hit
-
-// --- Backlight ---
 #define BL_PIN  4
 
+// ============================================================
+//  Motion detection config
+// ============================================================
+#define SAMPLE_INTERVAL_MS   100    // sample RSSI every 100ms
+#define BUFFER_SIZE          50     // rolling window of samples
+#define MOTION_HOLD_MS       3000   // keep "MOTION" state visible for 3s after last trigger
+#define MIN_STDDEV           0.5f   // ignore micro-noise below this stddev (flat signal)
+
+// ============================================================
+//  Display layout
+// ============================================================
+#define GRAPH_Y      0           // oscilloscope graph starts at top
+#define GRAPH_H      72          // top 72 rows = waveform area
+#define DIVIDER_Y    73
+#define STATUS_Y     78          // bottom area starts here
+#define GRAPH_W      W           // full width
+
+// ============================================================
+//  Colors
+// ============================================================
+#define COL_BG          TFT_BLACK
+#define COL_GRID        0x1082    // very dark grey
+#define COL_WAVE        0x07E0    // bright green (RSSI line)
+#define COL_WAVE_OLD    0x0320    // dim green (older samples)
+#define COL_CLEAR       0x07E0    // green text for CLEAR
+#define COL_MOTION      TFT_RED
+#define COL_TEXT        TFT_WHITE
+#define COL_LABEL       0xAD75    // muted grey-blue for labels
+#define COL_DIVIDER     0x2945
+#define COL_MEAN        0x04BF    // cyan tint for mean line
+#define COL_BAR_BG      0x2104    // dark bar background
+#define COL_BAR_FG      TFT_GREEN
+
+// ============================================================
+//  Globals
+// ============================================================
 TFT_eSPI    tft;
-TFT_eSprite radar(&tft);   // sprite for radar area
-TFT_eSprite sidebar(&tft); // sprite for sidebar
+TFT_eSprite graphSprite(&tft);
+TFT_eSprite statusSprite(&tft);
 
-// --- Network data ---
-struct Network {
-  char    ssid[33];
-  int32_t rssi;
-  uint8_t channel;
-  wifi_auth_mode_t enc;
-  float   angle;    // assigned radar angle (degrees)
-  float   dist;     // 0.0–1.0 mapped from RSSI
-  int     ttl;      // ticks until blip fades
-};
+int32_t  rssiBuffer[BUFFER_SIZE];
+int      bufHead      = 0;       // next write index (circular)
+int      bufCount     = 0;       // samples filled so far
+float    rollingMean  = 0.0f;
+float    rollingStddev = 0.0f;
 
-Network nets[MAX_NETWORKS];
-int     netCount = 0;
+uint32_t motionCount   = 0;
+uint32_t lastMotionMs  = 0;      // millis() of last detected motion event
+bool     inMotion      = false;
+char     lastMotionStr[32] = "None";
 
-// --- Sweep state ---
-float   sweepAngle  = 0;
-int     sidebarIdx  = 0;
-uint32_t lastScan   = 0;
-uint32_t lastFrame  = 0;
-uint32_t lastSidebar = 0;
+uint32_t lastSampleMs  = 0;
+uint32_t lastDrawMs    = 0;
 
-// --- Helpers ---
-float rssiToDist(int32_t rssi) {
-  // RSSI typically -30 (very strong) to -90 (very weak)
-  // Map to 0.15 (near center) to 0.92 (near edge)
-  float clamped = constrain((float)rssi, -90.0f, -30.0f);
-  return 0.15f + ((clamped + 30.0f) / -60.0f) * 0.77f;
-  // -30 → 0.15 (center), -90 → 0.92 (edge)
-}
+// ============================================================
+//  Rolling statistics
+// ============================================================
+void computeStats() {
+  if (bufCount == 0) { rollingMean = 0; rollingStddev = 0; return; }
 
-uint16_t rssiColor(int32_t rssi) {
-  if (rssi >= -60) return COL_STRONG;
-  if (rssi >= -75) return COL_MED;
-  return COL_WEAK;
-}
+  float sum = 0;
+  int   count = min(bufCount, BUFFER_SIZE);
+  for (int i = 0; i < count; i++) sum += rssiBuffer[i];
+  rollingMean = sum / count;
 
-const char* encStr(wifi_auth_mode_t enc) {
-  switch (enc) {
-    case WIFI_AUTH_OPEN:          return "OPEN";
-    case WIFI_AUTH_WEP:           return "WEP";
-    case WIFI_AUTH_WPA_PSK:       return "WPA";
-    case WIFI_AUTH_WPA2_PSK:      return "WPA2";
-    case WIFI_AUTH_WPA_WPA2_PSK:  return "WPA/2";
-    case WIFI_AUTH_WPA2_ENTERPRISE: return "ENT";
-    case WIFI_AUTH_WPA3_PSK:      return "WPA3";
-    default:                       return "????";
+  float varSum = 0;
+  for (int i = 0; i < count; i++) {
+    float d = rssiBuffer[i] - rollingMean;
+    varSum += d * d;
   }
+  rollingStddev = sqrtf(varSum / count);
 }
 
-// --- Scan WiFi ---
-void doScan() {
+// ============================================================
+//  WiFi connect (blocks until connected)
+// ============================================================
+void connectWiFi() {
+  tft.fillScreen(COL_BG);
+  tft.setTextColor(COL_TEXT, COL_BG);
+  tft.setTextFont(2);
+  tft.setCursor(8, 50);
+  tft.print("Connecting to WiFi...");
+
   WiFi.mode(WIFI_STA);
-  WiFi.disconnect();
-  int found = WiFi.scanNetworks(false, true); // blocking, show hidden
-  if (found < 0) found = 0;
-  if (found > MAX_NETWORKS) found = MAX_NETWORKS;
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
-  // Preserve blip TTL if same BSSID re-appears (match by SSID for simplicity)
-  // Build new list
-  Network newNets[MAX_NETWORKS];
-  int newCount = 0;
-
-  for (int i = 0; i < found; i++) {
-    Network& n = newNets[newCount++];
-    strncpy(n.ssid, WiFi.SSID(i).c_str(), 32);
-    n.ssid[32] = '\0';
-    n.rssi    = WiFi.RSSI(i);
-    n.channel = WiFi.channel(i);
-    n.enc     = WiFi.encryptionType(i);
-    n.dist    = rssiToDist(n.rssi);
-
-    // Try to keep angle from previous scan so blips don't jump
-    bool found_prev = false;
-    for (int j = 0; j < netCount; j++) {
-      if (strcmp(nets[j].ssid, n.ssid) == 0) {
-        n.angle = nets[j].angle;
-        n.ttl   = nets[j].ttl;
-        found_prev = true;
-        break;
-      }
-    }
-    if (!found_prev) {
-      // Assign deterministic angle based on SSID hash so it doesn't jump on rescan
-      uint32_t h = 5381;
-      for (int c = 0; n.ssid[c]; c++) h = ((h << 5) + h) + n.ssid[c];
-      n.angle = (float)(h % 360);
-      n.ttl   = 0;
+  uint32_t start = millis();
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    tft.print(".");
+    if (millis() - start > 20000) {
+      tft.fillScreen(COL_BG);
+      tft.setCursor(8, 50);
+      tft.setTextColor(TFT_RED, COL_BG);
+      tft.print("WiFi FAILED. Check creds.");
+      while (1) delay(5000);
     }
   }
 
-  memcpy(nets, newNets, sizeof(Network) * newCount);
-  netCount = newCount;
-
-  WiFi.scanDelete();
-  if (sidebarIdx >= netCount && netCount > 0) sidebarIdx = 0;
+  Serial.printf("[BOOT] Connected to %s  IP: %s\n",
+                WIFI_SSID, WiFi.localIP().toString().c_str());
 }
 
-// --- Draw radar background into sprite ---
-void drawRadarBg() {
-  radar.fillSprite(COL_BG);
+// ============================================================
+//  Sample RSSI and check for motion
+// ============================================================
+void takeSample() {
+  int32_t rssi = WiFi.RSSI();
 
-  // Concentric circles
-  for (int r = RADAR_R / 4; r <= RADAR_R; r += RADAR_R / 4) {
-    radar.drawCircle(RADAR_CX, RADAR_CY, r, COL_GRID);
-  }
-  // Cross-hairs
-  radar.drawFastHLine(RADAR_CX - RADAR_R, RADAR_CY, RADAR_R * 2, COL_GRID);
-  radar.drawFastVLine(RADAR_CX, RADAR_CY - RADAR_R, RADAR_R * 2, COL_GRID);
-  // Outer ring
-  radar.drawCircle(RADAR_CX, RADAR_CY, RADAR_R, COL_SWEEP_DIM);
+  // Store in circular buffer
+  rssiBuffer[bufHead] = rssi;
+  bufHead = (bufHead + 1) % BUFFER_SIZE;
+  if (bufCount < BUFFER_SIZE) bufCount++;
 
-  // Title above radar (in main tft, not sprite — draw once during init)
-}
+  // Need at least 10 samples before declaring motion
+  if (bufCount < 10) return;
 
-// --- Draw a single sweep line into the radar sprite ---
-void drawSweepLine(float angleDeg, uint16_t color) {
-  float rad = angleDeg * DEG_TO_RAD;
-  int x2 = RADAR_CX + (int)(RADAR_R * cos(rad));
-  int y2 = RADAR_CY + (int)(RADAR_R * sin(rad));
-  radar.drawLine(RADAR_CX, RADAR_CY, x2, y2, color);
-}
+  computeStats();
 
-// --- Draw blips ---
-void drawBlips() {
-  for (int i = 0; i < netCount; i++) {
-    Network& n = nets[i];
-    if (n.ttl <= 0) continue;
+  // Only fire if there's meaningful variance (not a perfectly flat signal)
+  if (rollingStddev < MIN_STDDEV) return;
 
-    float rad  = n.angle * DEG_TO_RAD;
-    int   bx   = RADAR_CX + (int)(RADAR_R * n.dist * cos(rad));
-    int   by   = RADAR_CY + (int)(RADAR_R * n.dist * sin(rad));
-    uint16_t col = rssiColor(n.rssi);
+  float deviation = fabsf((float)rssi - rollingMean);
+  if (deviation > SENSITIVITY * rollingStddev) {
+    uint32_t now = millis();
 
-    // Fade based on TTL
-    uint8_t alpha = (n.ttl > BLIP_TTL_TICKS / 2) ? 255 : 128;
-    (void)alpha; // TFT_eSPI doesn't have alpha blend; use full color
+    // Debounce: don't log a new event if we just logged one < 1s ago
+    if (now - lastMotionMs > 1000) {
+      motionCount++;
+      lastMotionMs = now;
 
-    radar.fillCircle(bx, by, 3, col);
-    radar.drawCircle(bx, by, 4, col);
-  }
-}
+      // Format timestamp as H:M:S since boot
+      uint32_t secs   = now / 1000;
+      uint32_t mins   = secs / 60;
+      uint32_t hours  = mins / 60;
+      snprintf(lastMotionStr, sizeof(lastMotionStr),
+               "%02lu:%02lu:%02lu", hours, mins % 60, secs % 60);
 
-// --- Draw sidebar ---
-void drawSidebar() {
-  sidebar.fillSprite(COL_BG);
-
-  // Header
-  sidebar.setTextColor(COL_TITLE, COL_BG);
-  sidebar.setTextSize(1);
-  sidebar.setCursor(2, 2);
-  sidebar.print("WiFi Radar");
-
-  sidebar.drawFastHLine(0, 12, SIDEBAR_W, COL_DIVIDER);
-
-  // Network count
-  sidebar.setTextColor(COL_TEXT, COL_BG);
-  sidebar.setCursor(2, 15);
-  sidebar.printf("%d nets found", netCount);
-  sidebar.drawFastHLine(0, 25, SIDEBAR_W, COL_DIVIDER);
-
-  if (netCount == 0) {
-    sidebar.setCursor(2, 30);
-    sidebar.setTextColor(COL_WEAK, COL_BG);
-    sidebar.print("Scanning...");
-    sidebar.pushSprite(SIDEBAR_X, 0);
-    return;
-  }
-
-  // Cycle through networks, show 4 at a time starting from sidebarIdx
-  int y = 30;
-  for (int slot = 0; slot < 4 && slot < netCount; slot++) {
-    int idx = (sidebarIdx + slot) % netCount;
-    Network& n = nets[idx];
-
-    // Highlight current
-    uint16_t bg = (slot == 0) ? COL_GRID : COL_BG;
-    sidebar.fillRect(0, y - 1, SIDEBAR_W, 26, bg);
-
-    // SSID (truncate if too long)
-    char trunc[14];
-    strncpy(trunc, n.ssid, 13);
-    trunc[13] = '\0';
-    if (strlen(n.ssid) > 13) {
-      trunc[11] = '.'; trunc[12] = '.'; trunc[13] = '\0';
+      Serial.printf("[MOTION] Event #%lu at %s  RSSI=%d  mean=%.1f  stddev=%.2f  dev=%.1f\n",
+                    motionCount, lastMotionStr, rssi,
+                    rollingMean, rollingStddev, deviation);
     }
-
-    sidebar.setTextColor(rssiColor(n.rssi), bg);
-    sidebar.setTextSize(1);
-    sidebar.setCursor(2, y);
-    sidebar.print(trunc);
-
-    // RSSI bar
-    int barW = map(constrain(n.rssi, -90, -30), -90, -30, 1, SIDEBAR_W - 4);
-    sidebar.fillRect(2, y + 10, barW, 4, rssiColor(n.rssi));
-    sidebar.fillRect(2 + barW, y + 10, SIDEBAR_W - 4 - barW, 4, COL_DIVIDER);
-
-    // RSSI + enc
-    sidebar.setTextColor(COL_TEXT, bg);
-    sidebar.setCursor(2, y + 16);
-    sidebar.printf("%ddBm %s", n.rssi, encStr(n.enc));
-
-    y += 26;
-    if (y + 26 > H) break;
+    inMotion = true;
   }
 
-  sidebar.pushSprite(SIDEBAR_X, 0);
+  // Clear motion state after hold period
+  if (inMotion && (millis() - lastMotionMs > MOTION_HOLD_MS)) {
+    inMotion = false;
+  }
 }
 
-// --- Vertical divider ---
-void drawDivider() {
-  tft.drawFastVLine(SIDEBAR_X - 1, 0, H, COL_DIVIDER);
+// ============================================================
+//  Draw oscilloscope waveform (top half)
+// ============================================================
+void drawGraph() {
+  graphSprite.fillSprite(COL_BG);
+
+  // Grid lines
+  for (int y = 0; y < GRAPH_H; y += GRAPH_H / 4) {
+    graphSprite.drawFastHLine(0, y, GRAPH_W, COL_GRID);
+  }
+  graphSprite.drawFastHLine(0, GRAPH_H - 1, GRAPH_W, COL_GRID);
+
+  // Draw the mean line
+  if (bufCount >= 10) {
+    // Map mean RSSI to Y pixel
+    int meanY = map((int)rollingMean, -100, -30, GRAPH_H - 2, 2);
+    meanY = constrain(meanY, 2, GRAPH_H - 2);
+    graphSprite.drawFastHLine(0, meanY, GRAPH_W, COL_MEAN);
+  }
+
+  // Draw RSSI samples as a waveform — oldest on left, newest on right
+  // We have up to BUFFER_SIZE samples. Map them across GRAPH_W pixels.
+  int count = min(bufCount, BUFFER_SIZE);
+  if (count < 2) { graphSprite.pushSprite(0, GRAPH_Y); return; }
+
+  // Walk from oldest to newest
+  // oldest sample index: if buffer is full, it's bufHead (next write = oldest)
+  //                      if not full, it's 0
+  int startIdx = (bufCount >= BUFFER_SIZE) ? bufHead : 0;
+
+  int prevX = -1, prevY = -1;
+  for (int i = 0; i < count; i++) {
+    int idx  = (startIdx + i) % BUFFER_SIZE;
+    int32_t rssi = rssiBuffer[idx];
+
+    int px = map(i, 0, count - 1, 0, GRAPH_W - 1);
+    int py = map((int)rssi, -100, -30, GRAPH_H - 2, 2);
+    py = constrain(py, 2, GRAPH_H - 2);
+
+    // Older samples dimmer, newer brighter
+    uint16_t col = (i > count - 10) ? COL_WAVE : COL_WAVE_OLD;
+
+    if (prevX >= 0) {
+      graphSprite.drawLine(prevX, prevY, px, py, col);
+    }
+    prevX = px;
+    prevY = py;
+  }
+
+  // Label: current RSSI in top-left
+  graphSprite.setTextFont(1);
+  graphSprite.setTextColor(COL_TEXT, COL_BG);
+  graphSprite.setCursor(2, 2);
+  if (bufCount > 0) {
+    int32_t latest = rssiBuffer[(bufHead + BUFFER_SIZE - 1) % BUFFER_SIZE];
+    graphSprite.printf("%d dBm", latest);
+  }
+
+  // Label: "RSSI" header on right
+  graphSprite.setTextColor(COL_LABEL, COL_BG);
+  graphSprite.setCursor(GRAPH_W - 36, 2);
+  graphSprite.print("RSSI");
+
+  graphSprite.pushSprite(0, GRAPH_Y);
 }
 
-// --- Setup ---
+// ============================================================
+//  Draw status panel (bottom half)
+// ============================================================
+void drawStatus() {
+  statusSprite.fillSprite(COL_BG);
+
+  int panelW = GRAPH_W;
+
+  // --- Motion status badge ---
+  if (inMotion) {
+    statusSprite.fillRoundRect(0, 0, 90, 22, 4, COL_MOTION);
+    statusSprite.setTextFont(4);
+    statusSprite.setTextColor(TFT_WHITE, COL_MOTION);
+    statusSprite.setCursor(5, 3);
+    statusSprite.print("MOTION");
+  } else {
+    statusSprite.fillRoundRect(0, 0, 68, 22, 4, 0x0340);
+    statusSprite.setTextFont(4);
+    statusSprite.setTextColor(COL_CLEAR, 0x0340);
+    statusSprite.setCursor(5, 3);
+    statusSprite.print("CLEAR");
+  }
+
+  // --- Motion confidence bar (right of badge) ---
+  // Shows how close current RSSI is to triggering threshold
+  float confidence = 0;
+  if (bufCount >= 10 && rollingStddev >= MIN_STDDEV) {
+    int32_t latest = rssiBuffer[(bufHead + BUFFER_SIZE - 1) % BUFFER_SIZE];
+    float dev = fabsf((float)latest - rollingMean);
+    confidence = dev / (SENSITIVITY * rollingStddev);  // 1.0 = at threshold
+    confidence = constrain(confidence, 0.0f, 1.0f);
+  }
+  int barX   = 96;
+  int barW   = panelW - barX - 2;
+  int fillW  = (int)(barW * confidence);
+  uint16_t barCol = (confidence > 0.85f) ? TFT_ORANGE : (confidence > 0.6f ? TFT_YELLOW : COL_BAR_FG);
+  statusSprite.fillRoundRect(barX, 5, barW, 12, 2, COL_BAR_BG);
+  if (fillW > 0) statusSprite.fillRoundRect(barX, 5, fillW, 12, 2, barCol);
+  statusSprite.setTextFont(1);
+  statusSprite.setTextColor(COL_LABEL, COL_BG);
+  statusSprite.setCursor(barX, 20);
+  statusSprite.print("sensitivity");
+
+  // --- Stats row ---
+  statusSprite.setTextFont(1);
+
+  // Motion count
+  statusSprite.setTextColor(COL_LABEL, COL_BG);
+  statusSprite.setCursor(0, 28);
+  statusSprite.print("Events:");
+  statusSprite.setTextColor(COL_TEXT, COL_BG);
+  statusSprite.printf(" %lu", motionCount);
+
+  // Last event timestamp
+  statusSprite.setTextColor(COL_LABEL, COL_BG);
+  statusSprite.setCursor(0, 40);
+  statusSprite.print("Last:   ");
+  statusSprite.setTextColor(COL_TEXT, COL_BG);
+  statusSprite.print(lastMotionStr);
+
+  // Mean / stddev
+  statusSprite.setTextColor(COL_LABEL, COL_BG);
+  statusSprite.setCursor(0, 52);
+  if (bufCount >= 2) {
+    statusSprite.setTextColor(COL_LABEL, COL_BG);
+    statusSprite.printf("mean %.1f  sd %.2f", rollingMean, rollingStddev);
+  } else {
+    statusSprite.setTextColor(COL_LABEL, COL_BG);
+    statusSprite.print("Warming up...");
+  }
+
+  statusSprite.pushSprite(0, STATUS_Y);
+}
+
+// ============================================================
+//  Setup
+// ============================================================
 void setup() {
   Serial.begin(115200);
 
@@ -278,69 +339,47 @@ void setup() {
   tft.setRotation(1);  // landscape, USB on left
   tft.fillScreen(COL_BG);
 
-  // Init sprites
-  radar.createSprite(RADAR_CX * 2 + 4, H);  // ~138 x 135
-  radar.setTextFont(1);
+  // Sprites
+  graphSprite.createSprite(GRAPH_W, GRAPH_H);
+  graphSprite.setTextFont(1);
 
-  sidebar.createSprite(SIDEBAR_W, H);
-  sidebar.setTextFont(1);
+  int statusH = H - STATUS_Y;
+  statusSprite.createSprite(GRAPH_W, statusH);
+  statusSprite.setTextFont(1);
 
-  drawDivider();
+  connectWiFi();
 
-  // Initial scan
-  doScan();
-  lastScan = millis();
+  tft.fillScreen(COL_BG);
+  tft.drawFastHLine(0, DIVIDER_Y, W, COL_DIVIDER);
+
+  Serial.printf("[BOOT] WiFi Motion Radar running. SSID=%s  Sensitivity=%.1f\n",
+                WIFI_SSID, SENSITIVITY);
+  Serial.println("[BOOT] Serial format: [MOTION] Event #N at HH:MM:SS  RSSI=X  mean=M  stddev=S  dev=D");
 }
 
-// --- Loop ---
+// ============================================================
+//  Loop
+// ============================================================
 void loop() {
   uint32_t now = millis();
 
-  // --- Rescan every SCAN_INTERVAL_MS ---
-  if (now - lastScan >= SCAN_INTERVAL_MS) {
-    doScan();
-    lastScan = now;
-  }
-
-  // --- Advance sweep angle ---
-  sweepAngle += SWEEP_STEP_DEG;
-  if (sweepAngle >= 360.0f) sweepAngle -= 360.0f;
-
-  // --- Check blip hits (sweep passing over a blip) ---
-  for (int i = 0; i < netCount; i++) {
-    float diff = fabs(sweepAngle - nets[i].angle);
-    if (diff > 180.0f) diff = 360.0f - diff;
-    if (diff < (float)SWEEP_STEP_DEG * 2) {
-      nets[i].ttl = BLIP_TTL_TICKS;
+  // Sample RSSI on interval
+  if (now - lastSampleMs >= SAMPLE_INTERVAL_MS) {
+    lastSampleMs = now;
+    if (WiFi.status() == WL_CONNECTED) {
+      takeSample();
+    } else {
+      // Reconnect if dropped
+      Serial.println("[WARN] WiFi disconnected, reconnecting...");
+      WiFi.reconnect();
     }
-    if (nets[i].ttl > 0) nets[i].ttl--;
   }
 
-  // --- Draw radar frame ---
-  drawRadarBg();
-
-  // Trailing sweep (dim lines behind main sweep)
-  for (int t = TRAIL_STEPS; t >= 1; t--) {
-    float trailAngle = sweepAngle - t * SWEEP_STEP_DEG;
-    if (trailAngle < 0) trailAngle += 360.0f;
-    // Fade: darker for older trail
-    uint8_t g = (uint8_t)(64 * (TRAIL_STEPS - t + 1) / TRAIL_STEPS);
-    uint16_t trailCol = tft.color565(0, g, 0);
-    drawSweepLine(trailAngle, trailCol);
+  // Redraw display every ~100ms (synced to sample rate)
+  if (now - lastDrawMs >= 100) {
+    lastDrawMs = now;
+    tft.drawFastHLine(0, DIVIDER_Y, W, COL_DIVIDER);
+    drawGraph();
+    drawStatus();
   }
-  // Main sweep line
-  drawSweepLine(sweepAngle, COL_SWEEP);
-
-  drawBlips();
-  radar.pushSprite(0, 0);
-
-  // --- Sidebar: cycle displayed network every 2s ---
-  if (now - lastSidebar >= 2000 && netCount > 0) {
-    sidebarIdx = (sidebarIdx + 1) % netCount;
-    lastSidebar = now;
-  }
-  drawSidebar();
-
-  // Small delay to control frame rate (~30fps target)
-  delay(33);
 }
