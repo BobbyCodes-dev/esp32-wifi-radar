@@ -1,5 +1,5 @@
 // esp32-wifi-radar — WiFi Motion/Presence Detector for LilyGo T-Display (ESP32, 135x240)
-// Libraries: TFT_eSPI by Bodmer
+// Libraries: TFT_eSPI by Bodmer, WebServer (built-in ESP32 Arduino core)
 // In TFT_eSPI/User_Setup_Select.h: uncomment Setup25_TTGO_T_Display.h
 //
 // Approach: RSSI-based motion sensing
@@ -8,15 +8,17 @@
 //   - Calculates rolling mean + stddev; deviation > SENSITIVITY * stddev = motion event
 //   - Display: top = live RSSI oscilloscope waveform, bottom = motion status + stats
 //   - Serial: logs every motion event with millis() timestamp
+//   - Web dashboard: served at http://<device-ip>/  — live RSSI chart, event log, stats
 
 #include <TFT_eSPI.h>
 #include <WiFi.h>
+#include <WebServer.h>
 #include <math.h>
 
 // ============================================================
 //  USER CONFIG — fill these in before flashing
 // ============================================================
-#define WIFI_SSID       "wifi gov secrets"
+#define WIFI_SSID       "Gov. Secrets"
 #define WIFI_PASSWORD   "Corona33!"
 
 // Sensitivity: how many standard deviations from the rolling mean
@@ -44,6 +46,11 @@
 #define MIN_STDDEV           0.5f   // ignore micro-noise below this stddev (flat signal)
 
 // ============================================================
+//  Event log config
+// ============================================================
+#define EVENT_LOG_SIZE  50          // keep last 50 motion events
+
+// ============================================================
 //  Display layout
 // ============================================================
 #define GRAPH_Y      0           // oscilloscope graph starts at top
@@ -69,11 +76,354 @@
 #define COL_BAR_FG      TFT_GREEN
 
 // ============================================================
+//  Web dashboard HTML (PROGMEM)
+// ============================================================
+static const char DASHBOARD_HTML[] PROGMEM = R"rawhtml(<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ESP32 WiFi Radar</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg: #0a0a0f;
+    --panel: #111118;
+    --border: #1e1e2e;
+    --text: #e0e0f0;
+    --muted: #555580;
+    --green: #00e676;
+    --red: #ff1744;
+    --cyan: #00e5ff;
+    --yellow: #ffd740;
+    --orange: #ff6d00;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Segoe UI', system-ui, sans-serif;
+    min-height: 100vh;
+    padding: 16px;
+  }
+  h1 {
+    font-size: 1.1rem;
+    font-weight: 600;
+    letter-spacing: 0.1em;
+    color: var(--cyan);
+    text-transform: uppercase;
+    margin-bottom: 16px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  h1 span.dot {
+    width: 10px; height: 10px;
+    border-radius: 50%;
+    background: var(--green);
+    display: inline-block;
+    box-shadow: 0 0 8px var(--green);
+    animation: pulse 1.4s ease-in-out infinite;
+  }
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50%       { opacity: 0.3; }
+  }
+
+  /* Status badge */
+  #status-badge {
+    display: inline-block;
+    padding: 8px 28px;
+    border-radius: 6px;
+    font-size: 2rem;
+    font-weight: 800;
+    letter-spacing: 0.15em;
+    text-align: center;
+    margin-bottom: 16px;
+    transition: background 0.2s, color 0.2s, box-shadow 0.2s;
+  }
+  #status-badge.clear {
+    background: #002200;
+    color: var(--green);
+    box-shadow: 0 0 18px #00e67640;
+  }
+  #status-badge.motion {
+    background: #220000;
+    color: var(--red);
+    box-shadow: 0 0 24px #ff174480;
+    animation: flash 0.5s ease-in-out infinite alternate;
+  }
+  @keyframes flash {
+    from { box-shadow: 0 0 12px #ff174440; }
+    to   { box-shadow: 0 0 32px #ff1744cc; }
+  }
+
+  /* Stats bar */
+  .stats-bar {
+    display: flex;
+    gap: 12px;
+    flex-wrap: wrap;
+    margin-bottom: 16px;
+  }
+  .stat-card {
+    flex: 1;
+    min-width: 110px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 14px;
+  }
+  .stat-label {
+    font-size: 0.68rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--muted);
+    margin-bottom: 4px;
+  }
+  .stat-value {
+    font-size: 1.35rem;
+    font-weight: 700;
+    color: var(--text);
+  }
+  .stat-value.rssi-value { color: var(--green); }
+  .stat-value.events-value { color: var(--cyan); }
+
+  /* Chart */
+  .chart-panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px;
+    margin-bottom: 16px;
+    height: 220px;
+    position: relative;
+  }
+  .chart-panel canvas { width: 100% !important; height: 100% !important; }
+
+  /* Event log */
+  .log-panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px;
+  }
+  .log-title {
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    color: var(--muted);
+    margin-bottom: 10px;
+  }
+  #event-log {
+    max-height: 220px;
+    overflow-y: auto;
+    font-family: 'Courier New', monospace;
+    font-size: 0.78rem;
+  }
+  #event-log::-webkit-scrollbar { width: 4px; }
+  #event-log::-webkit-scrollbar-track { background: transparent; }
+  #event-log::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+  .log-row {
+    display: flex;
+    justify-content: space-between;
+    padding: 4px 6px;
+    border-radius: 4px;
+    margin-bottom: 2px;
+    animation: fadein 0.3s ease;
+  }
+  @keyframes fadein { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; } }
+  .log-row:nth-child(odd) { background: #0d0d18; }
+  .log-num  { color: var(--muted); min-width: 40px; }
+  .log-time { color: var(--cyan); flex: 1; padding: 0 8px; }
+  .log-ms   { color: var(--yellow); text-align: right; }
+  .no-events { color: var(--muted); font-style: italic; padding: 8px 6px; }
+
+  /* Connection indicator */
+  #conn-indicator {
+    position: fixed;
+    top: 12px; right: 16px;
+    font-size: 0.7rem;
+    color: var(--muted);
+    letter-spacing: 0.05em;
+  }
+  #conn-indicator.ok   { color: var(--green); }
+  #conn-indicator.err  { color: var(--red); }
+</style>
+</head>
+<body>
+<div id="conn-indicator">●&nbsp;CONNECTING</div>
+
+<h1><span class="dot"></span>ESP32 WiFi Radar</h1>
+
+<div id="status-badge" class="clear">CLEAR</div>
+
+<div class="stats-bar">
+  <div class="stat-card">
+    <div class="stat-label">RSSI</div>
+    <div class="stat-value rssi-value" id="s-rssi">—</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">Mean</div>
+    <div class="stat-value" id="s-mean">—</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">Std Dev</div>
+    <div class="stat-value" id="s-stddev">—</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">Events</div>
+    <div class="stat-value events-value" id="s-events">—</div>
+  </div>
+</div>
+
+<div class="chart-panel">
+  <canvas id="rssiChart"></canvas>
+</div>
+
+<div class="log-panel">
+  <div class="log-title">Motion Event Log (newest first)</div>
+  <div id="event-log"><div class="no-events">No events yet</div></div>
+</div>
+
+<script>
+// ---- Chart setup ----
+const MAX_POINTS = 120;
+const labels = [];
+const data = [];
+for (let i = 0; i < MAX_POINTS; i++) { labels.push(''); data.push(null); }
+
+const ctx = document.getElementById('rssiChart').getContext('2d');
+const chart = new Chart(ctx, {
+  type: 'line',
+  data: {
+    labels,
+    datasets: [{
+      label: 'RSSI (dBm)',
+      data,
+      borderColor: '#00e676',
+      borderWidth: 1.5,
+      pointRadius: 0,
+      tension: 0.3,
+      fill: true,
+      backgroundColor: 'rgba(0,230,118,0.06)',
+    }]
+  },
+  options: {
+    animation: false,
+    responsive: true,
+    maintainAspectRatio: false,
+    plugins: {
+      legend: { display: false },
+      tooltip: { enabled: false },
+    },
+    scales: {
+      x: { display: false },
+      y: {
+        min: -100,
+        max: -30,
+        ticks: {
+          color: '#555580',
+          font: { size: 10 },
+          callback: v => v + ' dBm',
+          stepSize: 10,
+        },
+        grid: { color: '#1e1e2e' },
+        border: { color: '#1e1e2e' },
+      }
+    }
+  }
+});
+
+// ---- Helpers ----
+function fmtMs(ms) {
+  const s  = Math.floor(ms / 1000);
+  const h  = Math.floor(s / 3600);
+  const m  = Math.floor((s % 3600) / 60);
+  const sc = s % 60;
+  return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(sc).padStart(2,'0')}`;
+}
+
+const connEl = document.getElementById('conn-indicator');
+function setConn(ok) {
+  connEl.textContent = ok ? '● LIVE' : '● OFFLINE';
+  connEl.className   = ok ? 'ok' : 'err';
+}
+
+// ---- Poll /status every 500ms ----
+async function pollStatus() {
+  try {
+    const r = await fetch('/status');
+    if (!r.ok) throw new Error();
+    const d = await r.json();
+    setConn(true);
+
+    // Badge
+    const badge = document.getElementById('status-badge');
+    if (d.motion) {
+      badge.textContent = 'MOTION';
+      badge.className   = 'motion';
+    } else {
+      badge.textContent = 'CLEAR';
+      badge.className   = 'clear';
+    }
+
+    // Stats
+    document.getElementById('s-rssi').textContent   = d.rssi + ' dBm';
+    document.getElementById('s-mean').textContent   = d.mean.toFixed(1) + ' dBm';
+    document.getElementById('s-stddev').textContent = d.stddev.toFixed(2);
+    document.getElementById('s-events').textContent = d.event_count;
+
+    // Chart
+    data.shift(); data.push(d.rssi);
+    labels.shift(); labels.push('');
+    chart.update('none');
+  } catch(e) {
+    setConn(false);
+  }
+}
+
+// ---- Poll /events every 2s ----
+let lastEventCount = -1;
+async function pollEvents() {
+  try {
+    const r = await fetch('/events');
+    if (!r.ok) throw new Error();
+    const events = await r.json();
+    if (events.length === lastEventCount) return;
+    lastEventCount = events.length;
+
+    const log = document.getElementById('event-log');
+    if (events.length === 0) {
+      log.innerHTML = '<div class="no-events">No events yet</div>';
+      return;
+    }
+    log.innerHTML = events.map(e => `
+      <div class="log-row">
+        <span class="log-num">#${e.num}</span>
+        <span class="log-time">${e.timestamp}</span>
+        <span class="log-ms">${fmtMs(e.millis_since_boot)}</span>
+      </div>`).join('');
+  } catch(e) { /* ignore — status poller handles offline indicator */ }
+}
+
+// Kick off polls
+pollStatus();
+pollEvents();
+setInterval(pollStatus, 500);
+setInterval(pollEvents, 2000);
+</script>
+</body>
+</html>
+)rawhtml";
+
+// ============================================================
 //  Globals
 // ============================================================
 TFT_eSPI    tft;
 TFT_eSprite graphSprite(&tft);
 TFT_eSprite statusSprite(&tft);
+
+WebServer   server(80);
 
 int32_t  rssiBuffer[BUFFER_SIZE];
 int      bufHead      = 0;       // next write index (circular)
@@ -88,6 +438,26 @@ char     lastMotionStr[32] = "None";
 
 uint32_t lastSampleMs  = 0;
 uint32_t lastDrawMs    = 0;
+
+// ============================================================
+//  Event log (circular, last EVENT_LOG_SIZE motion events)
+// ============================================================
+struct MotionEvent {
+  uint32_t millisSinceBoot;
+  char     timestamp[16];   // HH:MM:SS
+  uint32_t eventNum;
+};
+MotionEvent eventLog[EVENT_LOG_SIZE];
+int eventLogHead  = 0;
+int eventLogCount = 0;
+
+void logMotionEvent(uint32_t nowMs, const char* ts, uint32_t num) {
+  eventLog[eventLogHead].millisSinceBoot = nowMs;
+  strncpy(eventLog[eventLogHead].timestamp, ts, sizeof(eventLog[0].timestamp) - 1);
+  eventLog[eventLogHead].eventNum = num;
+  eventLogHead = (eventLogHead + 1) % EVENT_LOG_SIZE;
+  if (eventLogCount < EVENT_LOG_SIZE) eventLogCount++;
+}
 
 // ============================================================
 //  Rolling statistics
@@ -134,8 +504,78 @@ void connectWiFi() {
     }
   }
 
+  // Show IP on TFT briefly
+  String ip = WiFi.localIP().toString();
+  tft.fillScreen(COL_BG);
+  tft.setTextColor(COL_TEXT, COL_BG);
+  tft.setTextFont(2);
+  tft.setCursor(8, 40);
+  tft.print("Connected!");
+  tft.setCursor(8, 62);
+  tft.setTextColor(COL_CLEAR, COL_BG);
+  tft.print("http://");
+  tft.print(ip);
+  delay(3000);  // show IP for 3 seconds before switching to radar view
+
   Serial.printf("[BOOT] Connected to %s  IP: %s\n",
-                WIFI_SSID, WiFi.localIP().toString().c_str());
+                WIFI_SSID, ip.c_str());
+  Serial.printf("[BOOT] Dashboard: http://%s/\n", ip.c_str());
+}
+
+// ============================================================
+//  HTTP handlers
+// ============================================================
+void handleRoot() {
+  server.send_P(200, "text/html", DASHBOARD_HTML);
+}
+
+void handleStatus() {
+  // Get current RSSI
+  int32_t currentRssi = 0;
+  if (bufCount > 0) {
+    currentRssi = rssiBuffer[(bufHead + BUFFER_SIZE - 1) % BUFFER_SIZE];
+  }
+
+  char json[256];
+  snprintf(json, sizeof(json),
+    "{\"rssi\":%d,\"mean\":%.2f,\"stddev\":%.2f,\"motion\":%s,\"event_count\":%lu,\"last_event_ms\":%lu}",
+    (int)currentRssi,
+    rollingMean,
+    rollingStddev,
+    inMotion ? "true" : "false",
+    motionCount,
+    lastMotionMs
+  );
+
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(200, "application/json", json);
+}
+
+void handleEvents() {
+  // Build JSON array of last EVENT_LOG_SIZE events, newest first
+  String json = "[";
+  bool first = true;
+
+  // Walk from newest to oldest
+  for (int i = 0; i < eventLogCount; i++) {
+    // Index of i-th newest: (eventLogHead - 1 - i + EVENT_LOG_SIZE) % EVENT_LOG_SIZE
+    int idx = (eventLogHead - 1 - i + EVENT_LOG_SIZE) % EVENT_LOG_SIZE;
+    if (!first) json += ",";
+    first = false;
+
+    char entry[128];
+    snprintf(entry, sizeof(entry),
+      "{\"num\":%lu,\"timestamp\":\"%s\",\"millis_since_boot\":%lu}",
+      eventLog[idx].eventNum,
+      eventLog[idx].timestamp,
+      eventLog[idx].millisSinceBoot
+    );
+    json += entry;
+  }
+  json += "]";
+
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(200, "application/json", json);
 }
 
 // ============================================================
@@ -172,6 +612,8 @@ void takeSample() {
       uint32_t hours  = mins / 60;
       snprintf(lastMotionStr, sizeof(lastMotionStr),
                "%02lu:%02lu:%02lu", hours, mins % 60, secs % 60);
+
+      logMotionEvent(now, lastMotionStr, motionCount);
 
       Serial.printf("[MOTION] Event #%lu at %s  RSSI=%d  mean=%.1f  stddev=%.2f  dev=%.1f\n",
                     motionCount, lastMotionStr, rssi,
@@ -349,6 +791,13 @@ void setup() {
 
   connectWiFi();
 
+  // Start web server
+  server.on("/",       HTTP_GET, handleRoot);
+  server.on("/status", HTTP_GET, handleStatus);
+  server.on("/events", HTTP_GET, handleEvents);
+  server.begin();
+  Serial.println("[BOOT] HTTP server started on port 80");
+
   tft.fillScreen(COL_BG);
   tft.drawFastHLine(0, DIVIDER_Y, W, COL_DIVIDER);
 
@@ -362,6 +811,9 @@ void setup() {
 // ============================================================
 void loop() {
   uint32_t now = millis();
+
+  // Handle incoming HTTP requests (non-blocking)
+  server.handleClient();
 
   // Sample RSSI on interval
   if (now - lastSampleMs >= SAMPLE_INTERVAL_MS) {
